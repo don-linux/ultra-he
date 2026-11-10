@@ -45,11 +45,13 @@ Cada release de Linux x86-64 trae un `.deb`, un `.rpm`, un AppImage y un `.tar.g
 
 ## Desarrollar
 
-Rust 1.98.1, fijado en `rust-toolchain.toml`, y estas librerías de desarrollo:
+Rust 1.98.1, fijado en `rust-toolchain.toml`, y estas librerías de desarrollo (las mismas que instala CI):
 
 ```sh
-sudo apt install pkg-config libudev-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-0 libssl-dev
+sudo apt install pkg-config libudev-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libssl-dev
 ```
+
+`hidapi` usa el backend `linux-native`, que enlaza libudev. Sin `libudev-dev`, `libudev-sys` aborta en `pkg-config --libs --cflags libudev` porque no encuentra `libudev.pc`. No hace falta definir `PKG_CONFIG_PATH`: el paquete deja el archivo en la ruta por defecto.
 
 ```sh
 cargo run
