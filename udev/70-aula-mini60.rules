@@ -1,0 +1,4 @@
+# Acceso al interfaz de configuración del AULA MINI 60 HE PRO
+# sin ser root. El teclado sigue funcionando como teclado.
+KERNEL=="hidraw*", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="80a2", TAG+="uaccess", MODE="0660"
+KERNEL=="hidraw*", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="fefe", TAG+="uaccess", MODE="0660"

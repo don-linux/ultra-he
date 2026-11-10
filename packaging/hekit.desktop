@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=hekit
+GenericName=Configurador de teclado
+Comment=Configura el AULA MINI 60 HE PRO
+Exec=hekit
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=keyboard;aula;hekit;
+StartupNotify=true

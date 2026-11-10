@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ] && [ -S /run/udev/control ]; then
+    udevadm control --reload-rules
+    udevadm trigger --subsystem-match=hidraw
+fi
+
+exit 0

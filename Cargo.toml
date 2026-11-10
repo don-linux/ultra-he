@@ -1,0 +1,58 @@
+[package]
+name = "hekit"
+version = "1.0.0"
+edition = "2021"
+description = "Configurador Linux para el teclado AULA MINI 60 HE PRO"
+license = "MIT"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hidapi = { version = "2.6.3", default-features = false, features = ["linux-native"] }
+eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "=0.36.2"
+egui_extras = { version = "=0.36.2", features = ["svg"] }
+rfd = "0.15"
+
+[profile.release]
+lto = false
+codegen-units = 1
+
+[package.metadata.deb]
+maintainer = "hekit <hekit@localhost>"
+copyright = "2026, hekit contributors"
+license-file = ["LICENSE"]
+section = "utils"
+priority = "optional"
+depends = "$auto, udev, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libssl3"
+extended-description = "Configura el AULA MINI 60 HE PRO: actuación, Rapid Trigger, capa Fn, mapa de teclas y luz guardada en el teclado. Al instalarse copia la regla udev y la recarga."
+assets = [
+  ["target/release/hekit", "usr/bin/", "755"],
+  ["udev/70-aula-mini60.rules", "usr/lib/udev/rules.d/70-hekit.rules", "644"],
+  ["packaging/hekit.desktop", "usr/share/applications/hekit.desktop", "644"],
+]
+maintainer-scripts = "packaging/deb/"
+
+# Linux RPM, built by .github/workflows/build.yml. source paths that start
+# with target/release/ are rewritten when --target is set. auto-req stays on:
+# RPM already records the SONAMEs the binary links. udev is explicit because
+# the rule needs udevadm, not only libudev.
+[package.metadata.generate-rpm]
+summary = "Configurador Linux para el teclado AULA MINI 60 HE PRO"
+assets = [
+  { source = "target/release/hekit", dest = "/usr/bin/hekit", mode = "755" },
+  { source = "packaging/hekit.desktop", dest = "/usr/share/applications/hekit.desktop", mode = "644" },
+  { source = "udev/70-aula-mini60.rules", dest = "/usr/lib/udev/rules.d/70-hekit.rules", mode = "644" },
+]
+post_install_script = "packaging/rpm/post"
+post_uninstall_script = "packaging/rpm/postun"
+
+[package.metadata.generate-rpm.requires]
+udev = "*"
+# Linked libraries are discovered by auto-req. These are the ones the .deb
+# names and ldd does not, because eframe opens them at run time.
+"libssl.so.3()(64bit)" = "*"
+"libxcb.so.1()(64bit)" = "*"
+"libxkbcommon.so.0()(64bit)" = "*"
+"libxkbcommon-x11.so.0()(64bit)" = "*"

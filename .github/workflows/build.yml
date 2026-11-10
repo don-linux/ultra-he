@@ -1,0 +1,226 @@
+name: Build
+
+# The single definition of how hekit is compiled and packaged. ci.yml calls
+# it for every pull request and release.yml for every v* tag, so a release
+# ships exactly what the pull request already built. Linux x86-64 only.
+on:
+  workflow_call:
+    inputs:
+      label:
+        description: Goes into every file name, e.g. v1.0.0 or pr-12
+        required: true
+        type: string
+      retention-days:
+        description: How long the packages stay downloadable from the run
+        required: false
+        type: number
+        default: 7
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # File names only. Kept out of the script text so a label cannot break the shell.
+  LABEL: ${{ inputs.label }}
+
+jobs:
+  linux:
+    name: Linux x86-64 (tar.gz, AppImage, deb, rpm)
+    # The glibc of this image is the oldest one the packages run on (2.39:
+    # Ubuntu 24.04, Debian 13, Fedora 40 and newer).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+      APPIMAGETOOL_VERSION: "1.9.1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build libraries
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libudev-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libssl-dev
+      # rust-toolchain.toml pins the compiler; this installs exactly that one.
+      - name: Rust toolchain
+        run: |
+          set -Eeuo pipefail
+          rustup toolchain install
+          rustup target add "$TARGET"
+      # No compiler cache: published binaries never build from outputs
+      # restored from an Actions cache.
+      - run: cargo build --release --locked --target "$TARGET"
+
+      - name: Version smoke test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [[ -z "${version}" ]]; then
+            printf 'could not read version from Cargo.toml\n' >&2
+            exit 1
+          fi
+          # Capture the whole --check output first. Piping straight into head
+          # closes the pipe after one line and, with pipefail, turns the
+          # second line into a SIGPIPE failure.
+          output="$(timeout 20s "target/${TARGET}/release/hekit" --check)"
+          got="$(printf '%s\n' "$output" | head -n 1 | tr -d '\r')"
+          if [[ "${got}" != "hekit ${version}" ]]; then
+            printf 'expected version hekit %s, got %s\n' "${version}" "${got}" >&2
+            exit 1
+          fi
+
+      # cargo-deb strips its own copy. Strip once so the archive, the
+      # AppImage, the .deb and the .rpm all ship the same binary.
+      - name: Strip
+        run: strip --strip-unneeded "target/${TARGET}/release/hekit"
+
+      - name: Packaging tools
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get install -y rpm desktop-file-utils
+          mkdir -p "$RUNNER_TEMP/tools"
+          cd "$RUNNER_TEMP/tools"
+          curl -fsSL -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | sha256sum -c
+          chmod +x appimagetool
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-deb@3.8.0,cargo-generate-rpm@0.21.0
+
+      - name: Desktop file
+        run: desktop-file-validate packaging/hekit.desktop
+
+      - name: Archive
+        run: |
+          set -Eeuo pipefail
+          name="hekit-${LABEL}-$TARGET"
+          mkdir -p "dist/$name/share/applications" "dist/$name/udev"
+          cp "target/$TARGET/release/hekit" README.md LICENSE "dist/$name/"
+          cp packaging/hekit.desktop "dist/$name/share/applications/"
+          cp udev/70-aula-mini60.rules "dist/$name/udev/70-hekit.rules"
+          tar czf "dist/$name.tar.gz" -C dist "$name"
+          rm -rf "dist/$name"
+
+      - name: Debian package
+        run: |
+          set -Eeuo pipefail
+          cargo deb --no-build --target "$TARGET" \
+            --output "dist/hekit-${LABEL}-x86_64.deb"
+
+      - name: RPM package
+        run: |
+          set -Eeuo pipefail
+          cargo generate-rpm --target "$TARGET" \
+            --output "dist/hekit-${LABEL}-x86_64.rpm"
+
+      # No system libraries inside: the app loads the windowing and graphics
+      # libraries of the machine it runs on, as the AppImage excludelist advises.
+      # The udev rule is packed so it can be copied by hand; an AppImage does
+      # not install it.
+      - name: AppImage
+        run: |
+          set -Eeuo pipefail
+          appdir="$RUNNER_TEMP/AppDir"
+          mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications" "$appdir/usr/lib/udev/rules.d"
+          cp "target/$TARGET/release/hekit" "$appdir/usr/bin/"
+          cp udev/70-aula-mini60.rules "$appdir/usr/lib/udev/rules.d/70-hekit.rules"
+          cp README.md LICENSE "$appdir/"
+          # appimagetool refuses a desktop file with no icon, and this project
+          # has no icon.svg. The PNG exists only inside the AppImage. The .deb
+          # and the .rpm keep packaging/hekit.desktop unchanged.
+          python3 - "$appdir/hekit.png" <<'PY'
+          import struct
+          import sys
+          import zlib
+
+          width = height = 256
+          pixel = bytes((32, 36, 48))
+
+          def chunk(tag, data):
+              return (
+                  struct.pack(">I", len(data))
+                  + tag
+                  + data
+                  + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+              )
+
+          raw = b"".join(b"\x00" + pixel * width for _ in range(height))
+          png = (
+              b"\x89PNG\r\n\x1a\n"
+              + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+              + chunk(b"IDAT", zlib.compress(raw, 9))
+              + chunk(b"IEND", b"")
+          )
+          with open(sys.argv[1], "wb") as out:
+              out.write(png)
+          PY
+          {
+            cat packaging/hekit.desktop
+            printf '\nIcon=hekit\n'
+          } > "$appdir/hekit.desktop"
+          cp "$appdir/hekit.desktop" "$appdir/usr/share/applications/hekit.desktop"
+          ln -sfn hekit.png "$appdir/.DirIcon"
+          ln -sfn usr/bin/hekit "$appdir/AppRun"
+          # The runner has no FUSE; extract-and-run avoids needing it.
+          APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 appimagetool --no-appstream \
+            "$appdir" "dist/hekit-${LABEL}-x86_64.AppImage"
+
+      - name: Check the packages
+        run: |
+          set -Eeuo pipefail
+          deb="dist/hekit-${LABEL}-x86_64.deb"
+          rpm="dist/hekit-${LABEL}-x86_64.rpm"
+          appimage="dist/hekit-${LABEL}-x86_64.AppImage"
+          archive="dist/hekit-${LABEL}-$TARGET.tar.gz"
+
+          tar tzf "$archive" | grep -F "udev/70-hekit.rules"
+          tar tzf "$archive" | grep -F "share/applications/hekit.desktop"
+
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          dpkg-deb --contents "$deb" | grep -F 'usr/lib/udev/rules.d/70-hekit.rules'
+          dpkg-deb --contents "$deb" | grep -F 'usr/share/applications/hekit.desktop'
+          if dpkg-deb --contents "$deb" | grep -F 'usr/lib/x86_64-linux-gnu/udev'; then
+            echo "::error::udev rule was redirected into the multiarch lib dir" >&2
+            exit 1
+          fi
+          # Proves every declared dependency resolves on the oldest supported Ubuntu.
+          sudo apt-get install -y "./$deb"
+          test -x /usr/bin/hekit
+          test -f /usr/lib/udev/rules.d/70-hekit.rules
+          test -f /usr/share/applications/hekit.desktop
+          output="$(timeout 20s hekit --check)"
+          got="$(printf '%s\n' "$output" | head -n 1 | tr -d '\r')"
+          test "$got" = "hekit $(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+
+          rpm -qpi "$rpm"
+          rpm -qpR "$rpm" | grep -E '(^| )udev( |$)'
+          rpm -qpl "$rpm" | grep -qx /usr/lib/udev/rules.d/70-hekit.rules
+          rpm -qpl "$rpm" | grep -qx /usr/share/applications/hekit.desktop
+          rpm -qpl "$rpm" | grep -qx /usr/bin/hekit
+
+          cd "$RUNNER_TEMP"
+          rm -rf -- "$RUNNER_TEMP/squashfs-root"
+          "$GITHUB_WORKSPACE/$appimage" --appimage-extract > /dev/null
+          test -x squashfs-root/AppRun
+          test -f squashfs-root/hekit.desktop
+          test -f squashfs-root/usr/lib/udev/rules.d/70-hekit.rules
+          output="$(timeout 20s squashfs-root/usr/bin/hekit --check)"
+          got="$(printf '%s\n' "$output" | head -n 1 | tr -d '\r')"
+          test "$got" = "hekit $(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$GITHUB_WORKSPACE/Cargo.toml" | head -n 1)"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.TARGET }}
+          path: |
+            dist/*.tar.gz
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
+          retention-days: ${{ inputs.retention-days }}
+          if-no-files-found: error

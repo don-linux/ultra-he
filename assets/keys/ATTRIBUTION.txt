@@ -1,0 +1,3 @@
+Las teclas SVG vienen de q2apro/keyboard-keys-speedflips, dedicadas al dominio público.
+El dibujo original es el teclado US de Wikimedia Commons, también de dominio público.
+No hay un SVG de la tecla Fn en ese paquete: hekit la rotula con texto.

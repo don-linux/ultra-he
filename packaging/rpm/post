@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+# $1 is 1 on install and 2 on upgrade. The new rule is already on disk.
+if [ -S /run/udev/control ]; then
+    udevadm control --reload-rules
+    udevadm trigger --subsystem-match=hidraw
+fi
+
+exit 0

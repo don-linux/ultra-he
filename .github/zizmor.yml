@@ -1,0 +1,6 @@
+# F1/F2 in docs/adversarial-reports/v1.0.0.md: whoever can push a v* tag
+# publishes the workflow in that commit. The reusable build workflow is
+# called from this repository on purpose (`uses: ./.github/workflows/build.yml`).
+rules:
+  self-repository:
+    disable: true

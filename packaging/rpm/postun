@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+# $1 is 0 when the package is erased. On upgrade it is 1 and the new
+# package's rule is already installed, so udev is left alone.
+if [ "$1" -eq 0 ] && [ -S /run/udev/control ]; then
+    udevadm control --reload-rules
+    udevadm trigger --subsystem-match=hidraw
+fi
+
+exit 0
