@@ -1,6 +1,9 @@
 pub mod actuation;
+pub mod backup;
+pub mod binding;
 pub mod board;
 pub mod dks;
+pub mod dump;
 pub mod endpoint;
 pub mod error;
 pub mod frame;
@@ -14,6 +17,7 @@ pub mod lighting;
 pub mod link;
 pub mod macro_store;
 pub mod profile;
+pub mod switch_map;
 pub mod switches;
 pub mod sync;
 

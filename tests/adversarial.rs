@@ -15,6 +15,7 @@ use hekit::link::{self, Kind};
 use hekit::macro_store::{self, Event};
 use hekit::profile;
 use hekit::switches::SwitchChoice;
+use hekit::sync;
 
 fn wired_board() -> Board {
     let mut board = Board::default();
@@ -252,7 +253,7 @@ fn rt_press_0_01_is_accepted() {
     let mut record = Record::default();
     actuation::set_rt_press(&mut record, SwitchChoice::Axis(2), 1).unwrap();
     assert_eq!(record.rt_press, 1);
-    assert_ne!(record.flags & 1, 0);
+    assert_eq!(record.flags & actuation::FLAG_FULL_TRAVEL, 0);
 }
 
 #[test]
@@ -265,21 +266,31 @@ fn changing_release_keeps_press() {
 }
 
 #[test]
-fn writing_rt_sets_bit0() {
-    let mut record = Record::default();
+fn rapid_trigger_is_on_only_when_both_distances_are_set() {
+    let mut record = Record {
+        rt_press: 0,
+        rt_release: 0,
+        ..Record::default()
+    };
+    assert!(!record.rt_enabled());
     actuation::set_rt_press(&mut record, SwitchChoice::Axis(6), 20).unwrap();
-    assert_eq!(record.flags & actuation::FLAG_RT, actuation::FLAG_RT);
+    actuation::set_rt_release(&mut record, SwitchChoice::Axis(6), 15).unwrap();
+    assert!(record.rt_enabled());
+    assert_eq!(record.flags & actuation::FLAG_FULL_TRAVEL, 0);
 }
 
 #[test]
-fn disabling_rt_keeps_distances() {
-    let mut record = Record::default();
-    actuation::set_rt_press(&mut record, SwitchChoice::Axis(6), 20).unwrap();
-    actuation::set_rt_release(&mut record, SwitchChoice::Axis(6), 15).unwrap();
+fn disabling_rt_writes_zero_and_clears_travel_bits() {
+    let mut record = Record {
+        flags: actuation::FLAG_FULL_TRAVEL | actuation::FLAG_BOTTOM_OPT | actuation::FLAG_RAMPAGE,
+        ..Record::default()
+    };
     actuation::set_rt_enabled(&mut record, false);
-    assert_eq!(record.rt_press, 20);
-    assert_eq!(record.rt_release, 15);
-    assert_eq!(record.flags & actuation::FLAG_RT, 0);
+    assert_eq!(record.rt_press, 0);
+    assert_eq!(record.rt_release, 0);
+    assert_eq!(record.flags & actuation::FLAG_FULL_TRAVEL, 0);
+    assert_eq!(record.flags & actuation::FLAG_BOTTOM_OPT, 0);
+    assert_ne!(record.flags & actuation::FLAG_RAMPAGE, 0);
 }
 
 #[test]
@@ -412,6 +423,14 @@ fn dks_slot_63_is_rejected() {
 }
 
 #[test]
+fn firmware_dks_slot_63_does_not_block_a_read() {
+    let mut board = wired_board();
+    board.dks[63].press = 0;
+    board.validate().unwrap();
+    board.capture_snapshot().unwrap();
+}
+
+#[test]
 fn macro_delay_65535_is_accepted() {
     assert_eq!(macro_store::check_delay(65535).unwrap(), 65535);
 }
@@ -487,7 +506,7 @@ fn speed_6_is_rejected() {
 fn mode_20_is_followed_by_the_color_table() {
     let mut board = wired_board();
     board.lighting.mode = 20;
-    let order = board.command_order();
+    let order = board.command_order().unwrap();
     assert_eq!(order[order.len() - 2], SET_LIGHT);
     assert_eq!(*order.last().unwrap(), SET_COLOR);
     assert_eq!(lighting::encode_colors(&board.colors).len(), 504);
@@ -543,8 +562,8 @@ fn hec_profile_without_rt_list_is_rejected() {
 }
 
 #[test]
-fn version_2_is_rejected() {
-    let json = r#"{"format":"mini60-config","version":2,"device":{"vid":"0x0C45","pid":"0x80A2","firmware":"1.53"}}"#;
+fn version_3_is_rejected() {
+    let json = r#"{"format":"mini60-config","version":3,"device":{"vid":"0x0C45","pid":"0x80A2","firmware":"1.53"}}"#;
     assert!(profile::parse_document(json).is_err());
 }
 
@@ -556,6 +575,7 @@ fn another_product_id_is_rejected() {
         pid: 0x80A2,
         firmware: "1.53".into(),
         battery: 0,
+        axial_model: 0,
     });
     let mut text = profile::to_pretty(&board).unwrap();
     text = text.replace("0x80A2", "0x1234");
@@ -583,6 +603,7 @@ fn round_trip_keeps_3_00_1_25_and_0_75() {
         pid: 0x80A2,
         firmware: "1.53".into(),
         battery: 0,
+        axial_model: 0,
     });
     board.set_trip(0, 300).unwrap();
     board.set_rt_press(0, 125).unwrap();
@@ -627,17 +648,17 @@ fn mouse_page_and_mod_tap_and_toggle_round_trip() {
 }
 
 #[test]
-fn write_order_is_globals_actuation_dks_macros_base_fn_light() {
+fn write_order_without_a_snapshot_is_the_hec_order() {
     let board = wired_board();
     assert_eq!(
-        board.command_order(),
+        board.command_order().unwrap(),
         vec![
-            SET_GLOBALS,
+            SET_KEYS,
+            SET_FN,
             SET_ACTUATION,
             SET_DKS,
             frame::SET_MACRO,
-            SET_KEYS,
-            SET_FN,
+            SET_GLOBALS,
             SET_LIGHT
         ]
     );
@@ -656,4 +677,150 @@ fn device_info_v153() {
     assert_eq!(info.vid, 0x0C45);
     assert_eq!(info.pid, 0x80A2);
     assert_eq!(info.firmware, "1.53");
+    payload[20] = 15;
+    payload[21] = 0;
+    let info = hekit::info::parse(&payload).unwrap();
+    assert_eq!(info.axial_model, 15);
+    assert_eq!(hekit::switches::default_axis_for_model(15), 6);
+    assert_eq!(hekit::switches::default_axis_for_model(18), 1);
+    assert_eq!(hekit::switches::default_axis_for_model(99), 6);
+}
+
+#[test]
+fn axis_byte_zero_is_the_factory_switch() {
+    assert_eq!(SwitchChoice::from_device_byte(0), SwitchChoice::Default);
+    let label = SwitchChoice::Default.label_with(6);
+    assert!(label.starts_with("De fábrica"));
+    assert!(!label.contains("0x"));
+}
+
+#[test]
+fn read_rt_off_exports_and_reloads_unchanged() {
+    let mut board = wired_board();
+    board.info = Some(hekit::info::DeviceInfo {
+        vid: 0x0C45,
+        pid: 0x80A2,
+        firmware: "1.53".into(),
+        battery: 0,
+        axial_model: 15,
+    });
+    board.choice[4] = SwitchChoice::Default;
+    board.actuation[4] = Record {
+        axis_type: 0,
+        flags: 0,
+        trip: 0,
+        rt_press: 0,
+        rt_release: 0,
+    };
+    let loaded = profile::parse_document(&profile::to_pretty(&board).unwrap()).unwrap();
+    assert_eq!(loaded.actuation[4].encode(), board.actuation[4].encode());
+    assert_eq!(loaded.choice[4], SwitchChoice::Default);
+}
+
+#[test]
+fn binding_labels_never_use_hex() {
+    let letter = hekit::binding::label_of(keys::keyboard(0, 0x04));
+    assert_eq!(letter, "A");
+    assert!(!letter.contains("0x"));
+    let custom = KeyRecord {
+        page: 99,
+        b1: 0xAB,
+        b2: 0xCD,
+        b3: 1,
+    };
+    assert_eq!(hekit::binding::label_of(custom), "Personalizada");
+    assert_eq!(hekit::binding::function_label(2), "BT 1");
+}
+
+#[test]
+fn an_unchanged_board_sends_no_set() {
+    let mut board = wired_board();
+    board.capture_snapshot().unwrap();
+    let mut endpoint = Endpoint::new(MockIo::wired());
+    sync::upload(&mut endpoint, &mut board).unwrap();
+    assert!(endpoint.io.frames.iter().all(|frame| frame[1] < 0x20));
+}
+
+#[test]
+fn only_the_dirty_fn_table_is_written() {
+    let mut board = wired_board();
+    board.capture_snapshot().unwrap();
+    board.fn_layer[28] = keys::keyboard(0, 0x45);
+    let mut endpoint = Endpoint::new(MockIo::wired());
+    sync::upload(&mut endpoint, &mut board).unwrap();
+    let sets: Vec<u8> = endpoint
+        .io
+        .frames
+        .iter()
+        .map(|frame| frame[1])
+        .filter(|cmd| *cmd >= 0x20)
+        .collect();
+    assert!(!sets.is_empty());
+    assert!(sets.iter().all(|cmd| *cmd == SET_FN));
+}
+
+#[test]
+fn hec_object_pack_is_accepted() {
+    let mut object = serde_json::Map::new();
+    for index in 0..actuation::TABLE {
+        object.insert(index.to_string(), serde_json::json!(0));
+    }
+    object.insert("0".into(), serde_json::json!(2));
+    let json = serde_json::json!({ "RTlist": object });
+    let board = profile::parse_document(&json.to_string()).unwrap();
+    assert_eq!(board.actuation[0].axis_type, 2);
+}
+
+#[test]
+fn jade_ultra_map_survives_a_read_overlay() {
+    let mut board = wired_board();
+    board.actuation[17].axis_type = 2;
+    board.choice[17] = SwitchChoice::from_device_byte(2);
+    let mut map = hekit::switch_map::SwitchMap::default();
+    map.mark([17]);
+    map.overlay(&mut board);
+    assert_eq!(board.choice[17], SwitchChoice::JadeUltra);
+    board.choice[17] = SwitchChoice::Axis(2);
+    map.overlay(&mut board);
+    assert_eq!(board.choice[17], SwitchChoice::JadeUltra);
+}
+
+#[test]
+fn axis_1_cap_is_higher_on_the_dongle() {
+    assert_eq!(SwitchChoice::Axis(1).cap(false, 6).unwrap(), 330);
+    assert_eq!(SwitchChoice::Axis(1).cap(true, 6).unwrap(), 340);
+}
+
+#[test]
+fn bottom_row_follows_hec() {
+    let bottom: Vec<u16> = layout::keys()
+        .into_iter()
+        .filter(|key| key.y == 4.0)
+        .map(|key| key.index)
+        .collect();
+    assert_eq!(bottom, vec![80, 81, 82, 83, 84, 86, 87, 85]);
+}
+
+#[test]
+fn fn_number_row_is_locked_to_f_keys() {
+    assert!(hekit::binding::fn_locked(17));
+    assert_eq!(hekit::binding::factory_at(28).unwrap().label, "F12");
+    assert!(!hekit::binding::fn_locked(33));
+}
+
+#[test]
+fn version_1_profile_still_imports() {
+    let mut board = wired_board();
+    board.info = Some(hekit::info::DeviceInfo {
+        vid: 0x0C45,
+        pid: 0x80A2,
+        firmware: "1.53".into(),
+        battery: 0,
+        axial_model: 0,
+    });
+    let text = profile::to_pretty(&board)
+        .unwrap()
+        .replace("\"version\": 2", "\"version\": 1");
+    let loaded = profile::parse_document(&text).unwrap();
+    assert_eq!(loaded.actuation[0].trip, board.actuation[0].trip);
 }

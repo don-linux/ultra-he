@@ -5,8 +5,17 @@ pub const RECORDS: usize = 126;
 pub const RECORD: usize = 8;
 pub const TABLE: usize = RECORDS * RECORD;
 
-pub const FLAG_RT: u8 = 0b0000_0001;
-pub const FLAG_RAMPAGE: u8 = 0b0000_0010;
+/// Bit 0 de hec: "Activación rápida de todo el recorrido".
+pub const FLAG_FULL_TRAVEL: u8 = 0b0000_0001;
+/// Bit 1 de hec: "Optimización de fondo". Este teclado no la muestra.
+pub const FLAG_BOTTOM_OPT: u8 = 0b0000_0010;
+/// Bit 2 de hec: Rampage. El MINI 60 HE PRO tiene `isModel: false`.
+pub const FLAG_RAMPAGE: u8 = 0b0000_0100;
+
+/// Sensibilidad que hec escribe al encender Rapid Trigger (`sensitivity: 10`).
+pub const RT_DEFAULT: u16 = 10;
+/// Recorrido que hec muestra cuando el firmware trae 0 (`currentTrip: 12`).
+pub const TRIP_DEFAULT: u16 = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Record {
@@ -57,43 +66,120 @@ impl Record {
         })
     }
 
+    /// hec: Rapid Trigger está activo solo si presión y liberación son distintas de 0.
     pub fn rt_enabled(self) -> bool {
-        self.flags & FLAG_RT != 0
+        self.rt_press != 0 && self.rt_release != 0
+    }
+
+    pub fn full_travel(self) -> bool {
+        self.flags & FLAG_FULL_TRAVEL != 0
+    }
+
+    pub fn bottom_opt(self) -> bool {
+        self.flags & FLAG_BOTTOM_OPT != 0
     }
 
     pub fn rampage(self) -> bool {
         self.flags & FLAG_RAMPAGE != 0
     }
+
+    /// Valor que se muestra. Un 0 leído se enseña como 1.20 mm y se escribe tal cual.
+    pub fn display_trip(self) -> u16 {
+        if self.trip == 0 {
+            TRIP_DEFAULT
+        } else {
+            self.trip
+        }
+    }
 }
 
 pub fn set_trip(record: &mut Record, choice: SwitchChoice, trip: u16) -> Result<()> {
-    switches::check_trip(choice, trip)?;
+    let max = choice.max_cmm()?;
+    set_trip_capped(record, choice, trip, max)
+}
+
+pub fn set_trip_capped(
+    record: &mut Record,
+    choice: SwitchChoice,
+    trip: u16,
+    max: u16,
+) -> Result<()> {
+    if trip < TRIP_MIN || trip > max {
+        return Err(Error::OutOfRange {
+            field: "actuación",
+            detail: format!("{trip} centésimas, permitido {TRIP_MIN}..={max}"),
+        });
+    }
     record.trip = trip;
     record.axis_type = choice.axis_byte();
     Ok(())
 }
 
 pub fn set_rt_press(record: &mut Record, choice: SwitchChoice, value: u16) -> Result<()> {
-    switches::check_rt(choice, value)?;
+    let max = choice.max_cmm()?;
+    set_rt_press_capped(record, choice, value, max)
+}
+
+pub fn set_rt_press_capped(
+    record: &mut Record,
+    choice: SwitchChoice,
+    value: u16,
+    max: u16,
+) -> Result<()> {
+    check_edited_rt(value, max)?;
     record.rt_press = value;
-    record.flags |= FLAG_RT;
     record.axis_type = choice.axis_byte();
     Ok(())
 }
 
 pub fn set_rt_release(record: &mut Record, choice: SwitchChoice, value: u16) -> Result<()> {
-    switches::check_rt(choice, value)?;
+    let max = choice.max_cmm()?;
+    set_rt_release_capped(record, choice, value, max)
+}
+
+pub fn set_rt_release_capped(
+    record: &mut Record,
+    choice: SwitchChoice,
+    value: u16,
+    max: u16,
+) -> Result<()> {
+    check_edited_rt(value, max)?;
     record.rt_release = value;
-    record.flags |= FLAG_RT;
     record.axis_type = choice.axis_byte();
     Ok(())
 }
 
+fn check_edited_rt(value: u16, max: u16) -> Result<()> {
+    if value < RT_MIN || value > max {
+        return Err(Error::OutOfRange {
+            field: "rapid trigger",
+            detail: format!("{value} centésimas, permitido {RT_MIN}..={max}"),
+        });
+    }
+    Ok(())
+}
+
+/// Encender usa 0.10 mm donde haya un 0. Apagar escribe 0/0 y limpia los bits 0 y 1.
 pub fn set_rt_enabled(record: &mut Record, enabled: bool) {
     if enabled {
-        record.flags |= FLAG_RT;
+        if record.rt_press == 0 {
+            record.rt_press = RT_DEFAULT;
+        }
+        if record.rt_release == 0 {
+            record.rt_release = RT_DEFAULT;
+        }
     } else {
-        record.flags &= !FLAG_RT;
+        record.rt_press = 0;
+        record.rt_release = 0;
+        record.flags &= !(FLAG_FULL_TRAVEL | FLAG_BOTTOM_OPT);
+    }
+}
+
+pub fn set_full_travel(record: &mut Record, enabled: bool) {
+    if enabled {
+        record.flags |= FLAG_FULL_TRAVEL;
+    } else {
+        record.flags &= !FLAG_FULL_TRAVEL;
     }
 }
 
@@ -155,27 +241,26 @@ pub fn mm_text(cmm: u16) -> String {
     format!("{}.{:02}", cmm / 100, cmm % 100)
 }
 
+/// Acepta recorrido 0 y Rapid Trigger 0/0, que es lo que devuelve el teclado.
+/// Un valor editado distinto de 0 sigue teniendo mínimo y tope.
 pub fn validate_record(choice: SwitchChoice, record: &Record) -> Result<()> {
     if record.axis_type != choice.axis_byte() {
         return Err(Error::Protocol("el byte de eje no coincide con el perfil"));
     }
-    if record.trip < TRIP_MIN {
-        return Err(Error::OutOfRange {
-            field: "actuación",
-            detail: record.trip.to_string(),
-        });
+    if record.trip != 0 {
+        if record.trip < TRIP_MIN {
+            return Err(Error::OutOfRange {
+                field: "actuación",
+                detail: record.trip.to_string(),
+            });
+        }
+        switches::check_trip(choice, record.trip)?;
     }
-    switches::check_trip(choice, record.trip)?;
-    if record.rt_press < RT_MIN || record.rt_release < RT_MIN {
-        return Err(Error::OutOfRange {
-            field: "rapid trigger",
-            detail: format!(
-                "presión {} liberación {}",
-                record.rt_press, record.rt_release
-            ),
-        });
+    if record.rt_press != 0 {
+        switches::check_rt(choice, record.rt_press)?;
     }
-    switches::check_rt(choice, record.rt_press)?;
-    switches::check_rt(choice, record.rt_release)?;
+    if record.rt_release != 0 {
+        switches::check_rt(choice, record.rt_release)?;
+    }
     Ok(())
 }

@@ -10,7 +10,7 @@ use crate::info::{self, DeviceInfo};
 use crate::keys::{self, KeyRecord};
 use crate::lighting::{self, Lighting};
 use crate::macro_store::{self, Event};
-use crate::switches::SwitchChoice;
+use crate::switches::{self, SwitchChoice};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
@@ -19,10 +19,44 @@ pub enum Origin {
     File,
 }
 
+/// Copia de las tablas tal como se escribirían. Sirve para saber qué cambió.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    pub globals: Vec<u8>,
+    pub actuation: Vec<u8>,
+    pub dks: Vec<u8>,
+    pub macros: Vec<u8>,
+    pub base: Vec<u8>,
+    pub fn_layer: Vec<u8>,
+    pub light: Vec<u8>,
+    pub colors: Vec<u8>,
+}
+
+impl Snapshot {
+    fn bytes(&self, cmd: u8) -> &[u8] {
+        match cmd {
+            SET_GLOBALS => &self.globals,
+            SET_ACTUATION => &self.actuation,
+            SET_DKS => &self.dks,
+            frame::SET_MACRO => &self.macros,
+            SET_KEYS => &self.base,
+            SET_FN => &self.fn_layer,
+            SET_LIGHT => &self.light,
+            SET_COLOR => &self.colors,
+            _ => &[],
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Board {
     pub origin: Origin,
     pub info: Option<DeviceInfo>,
+    /// True cuando la última lectura fue por el receptor. Cambia el tope del eje 1.
+    pub dongle: bool,
+    /// Eje que hec usa cuando el byte de la tecla es 0.
+    pub default_axis: u8,
+    pub snapshot: Option<Snapshot>,
     pub globals: Globals,
     pub actuation: [Record; actuation::RECORDS],
     pub choice: [SwitchChoice; actuation::RECORDS],
@@ -41,6 +75,9 @@ impl Default for Board {
         Self {
             origin: Origin::Empty,
             info: None,
+            dongle: false,
+            default_axis: switches::FALLBACK_AXIS,
+            snapshot: None,
             globals: Globals::default(),
             actuation: [Record::default(); actuation::RECORDS],
             choice: [SwitchChoice::Axis(6); actuation::RECORDS],
@@ -61,18 +98,22 @@ impl Board {
         self.origin != Origin::Empty
     }
 
+    pub fn cap_of(&self, choice: SwitchChoice) -> Result<u16> {
+        choice.cap(self.dongle, self.default_axis)
+    }
+
     /// Cambia el eje y, si el punto actual no cabe, lo baja al tope nuevo.
     pub fn assign_switch(&mut self, index: usize, choice: SwitchChoice) -> Result<()> {
-        let max = choice.max_cmm()?;
+        let max = self.cap_of(choice)?;
         let record = self.slot_mut(index)?;
         if record.trip > max {
             record.trip = max;
         }
         if record.rt_press > max {
-            record.rt_press = max.max(crate::switches::RT_MIN);
+            record.rt_press = max;
         }
         if record.rt_release > max {
-            record.rt_release = max.max(crate::switches::RT_MIN);
+            record.rt_release = max;
         }
         record.axis_type = choice.axis_byte();
         self.choice[index] = choice;
@@ -80,11 +121,9 @@ impl Board {
     }
 
     pub fn set_switch(&mut self, index: usize, choice: SwitchChoice) -> Result<()> {
+        let max = self.cap_of(choice)?;
         let record = self.slot_mut(index)?;
-        if record.trip > choice.max_cmm()?
-            || record.rt_press > choice.max_cmm()?
-            || record.rt_release > choice.max_cmm()?
-        {
+        if record.trip > max || record.rt_press > max || record.rt_release > max {
             return Err(Error::OutOfRange {
                 field: "eje",
                 detail: "baja la actuación o el rapid trigger antes de cambiar a un tope menor"
@@ -98,34 +137,33 @@ impl Board {
 
     pub fn set_trip(&mut self, index: usize, trip: u16) -> Result<()> {
         let choice = self.choice[index];
+        let max = self.cap_of(choice)?;
         let record = self.slot_mut(index)?;
-        let rampage = record.flags & actuation::FLAG_RAMPAGE;
-        let axis_before = record.axis_type;
-        actuation::set_trip(record, choice, trip)?;
-        if choice.axis_byte() == axis_before {
-            record.axis_type = axis_before;
-        }
-        record.flags = (record.flags & !actuation::FLAG_RAMPAGE) | rampage;
+        let flags = record.flags;
+        actuation::set_trip_capped(record, choice, trip, max)?;
+        record.flags = flags;
         Ok(())
     }
 
     pub fn set_rt_press(&mut self, index: usize, value: u16) -> Result<()> {
         let choice = self.choice[index];
+        let max = self.cap_of(choice)?;
         let record = self.slot_mut(index)?;
-        let rampage = record.flags & actuation::FLAG_RAMPAGE;
-        actuation::set_rt_press(record, choice, value)?;
-        record.flags |= rampage;
+        let flags = record.flags;
+        actuation::set_rt_press_capped(record, choice, value, max)?;
+        record.flags = flags;
         Ok(())
     }
 
     pub fn set_rt_release(&mut self, index: usize, value: u16) -> Result<()> {
         let choice = self.choice[index];
+        let max = self.cap_of(choice)?;
         let press = record_press(self, index)?;
         let record = self.slot_mut(index)?;
-        let rampage = record.flags & actuation::FLAG_RAMPAGE;
-        actuation::set_rt_release(record, choice, value)?;
+        let flags = record.flags;
+        actuation::set_rt_release_capped(record, choice, value, max)?;
         record.rt_press = press;
-        record.flags |= rampage;
+        record.flags = flags;
         Ok(())
     }
 
@@ -135,32 +173,123 @@ impl Board {
         Ok(())
     }
 
+    pub fn set_full_travel(&mut self, index: usize, enabled: bool) -> Result<()> {
+        let record = self.slot_mut(index)?;
+        actuation::set_full_travel(record, enabled);
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         for (index, record) in self.actuation.iter().enumerate() {
             actuation::validate_record(self.choice[index], record)?;
         }
-        for slot in 0..dks::SLOTS {
-            if self.dks[slot] != Slot::default() {
-                dks::check_slot(slot as u8)?;
-            }
-        }
+        // La tabla DKS tiene 64 ranuras. La 63 no se puede asignar a una tecla
+        // nueva, pero el firmware la devuelve y hay que conservarla.
         Ok(())
     }
 
-    pub fn command_order(&self) -> Vec<u8> {
-        let mut order = vec![
-            SET_GLOBALS,
+    /// Orden de hec, solo con las tablas distintas a la última lectura.
+    /// Sin lectura previa se consideran todas sucias.
+    pub fn command_order(&self) -> Result<Vec<u8>> {
+        let candidates = [
+            SET_KEYS,
+            SET_FN,
             SET_ACTUATION,
             SET_DKS,
             frame::SET_MACRO,
-            SET_KEYS,
-            SET_FN,
+            SET_GLOBALS,
             SET_LIGHT,
         ];
-        if self.lighting.mode == 20 {
-            order.push(SET_COLOR);
+        let Some(snapshot) = &self.snapshot else {
+            let mut order = candidates.to_vec();
+            if self.lighting.mode == 20 {
+                order.push(SET_COLOR);
+            }
+            return Ok(order);
+        };
+        let mut order = Vec::new();
+        for cmd in candidates {
+            if self.payload(cmd)? != snapshot.bytes(cmd) {
+                order.push(cmd);
+            }
         }
-        order
+        if self.lighting.mode == 20 {
+            let colors = self.payload(SET_COLOR)?;
+            let light_changed = self.payload(SET_LIGHT)? != snapshot.light;
+            if colors != snapshot.colors || light_changed {
+                order.push(SET_COLOR);
+            }
+        }
+        Ok(order)
+    }
+
+    pub fn payload(&self, cmd: u8) -> Result<Vec<u8>> {
+        Ok(match cmd {
+            SET_GLOBALS => self.globals.raw.to_vec(),
+            SET_ACTUATION => self.actuation_bytes()?.to_vec(),
+            SET_DKS => dks::encode_table(&self.dks).to_vec(),
+            frame::SET_MACRO => {
+                if self.macros_edited || self.origin == Origin::File {
+                    macro_image(self)?
+                } else {
+                    self.raw_macros.clone()
+                }
+            }
+            SET_KEYS => keys::base_write_bytes(&self.base)?,
+            SET_FN => keys::fn_write_bytes(&self.fn_layer),
+            SET_LIGHT => self.lighting.encode()?.to_vec(),
+            SET_COLOR => lighting::encode_colors(&self.colors).to_vec(),
+            _ => return Err(Error::Protocol("comando de escritura desconocido")),
+        })
+    }
+
+    pub fn capture_snapshot(&mut self) -> Result<()> {
+        self.snapshot = Some(Snapshot {
+            globals: self.payload(SET_GLOBALS)?,
+            actuation: self.payload(SET_ACTUATION)?,
+            dks: self.payload(SET_DKS)?,
+            macros: self.payload(frame::SET_MACRO)?,
+            base: self.payload(SET_KEYS)?,
+            fn_layer: self.payload(SET_FN)?,
+            light: self.payload(SET_LIGHT)?,
+            colors: self.payload(SET_COLOR)?,
+        });
+        Ok(())
+    }
+
+    pub fn change_summary(&self) -> Result<String> {
+        let Some(snapshot) = &self.snapshot else {
+            return Ok("Sin lectura previa: se escribirían todas las tablas.".into());
+        };
+        let order = self.command_order()?;
+        if order.is_empty() {
+            return Ok("No hay cambios respecto a la última lectura.".into());
+        }
+        let mut parts = Vec::new();
+        for cmd in order {
+            let part = match cmd {
+                SET_ACTUATION => format!(
+                    "Actuación: {} teclas",
+                    count_record_diffs(&self.payload(SET_ACTUATION)?, &snapshot.actuation, 8)
+                ),
+                SET_FN => format!(
+                    "Capa Fn: {} teclas",
+                    count_record_diffs(&self.payload(SET_FN)?, &snapshot.fn_layer, 4)
+                ),
+                SET_KEYS => format!(
+                    "Capa normal: {} teclas",
+                    count_record_diffs(&self.payload(SET_KEYS)?, &snapshot.base, 4)
+                ),
+                SET_GLOBALS => "Sistema".to_string(),
+                SET_DKS => "DKS".to_string(),
+                frame::SET_MACRO => "Macros".to_string(),
+                SET_LIGHT => "Luz".to_string(),
+                SET_COLOR => "Color por tecla".to_string(),
+                _ => continue,
+            };
+            parts.push(part);
+        }
+        Ok(parts.join("; "))
     }
 
     pub fn actuation_bytes(&self) -> Result<[u8; actuation::TABLE]> {
@@ -187,7 +316,9 @@ impl Board {
     }
 
     pub fn apply_info(&mut self, payload: &[u8]) -> Result<()> {
-        self.info = Some(info::parse(payload)?);
+        let info = info::parse(payload)?;
+        self.default_axis = switches::default_axis_for_model(info.axial_model);
+        self.info = Some(info);
         Ok(())
     }
 
@@ -196,6 +327,25 @@ impl Board {
             .get_mut(index)
             .ok_or(Error::Protocol("índice de tecla fuera de la tabla"))
     }
+}
+
+fn count_record_diffs(now: &[u8], before: &[u8], size: usize) -> usize {
+    let slots = layout_indexes();
+    slots
+        .into_iter()
+        .filter(|index| {
+            let start = index * size;
+            let end = start + size;
+            now.get(start..end) != before.get(start..end)
+        })
+        .count()
+}
+
+fn layout_indexes() -> Vec<usize> {
+    crate::layout::keys()
+        .into_iter()
+        .map(|key| key.index as usize)
+        .collect()
 }
 
 fn record_press(board: &Board, index: usize) -> Result<u16> {

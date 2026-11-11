@@ -148,31 +148,10 @@ fn modifier_name(usage: u8) -> Option<&'static str> {
 }
 
 fn function_name(id: u32) -> Option<&'static str> {
-    Some(match id {
-        1 => "Restaurar fábrica",
-        2 => "BT 1",
-        3 => "BT 2",
-        4 => "BT 3",
-        5 => "Reconexión",
-        6 => "Zona F",
-        7 => "Batería",
-        8 => "Win",
-        9 => "Mac",
-        10 => "Android",
-        11 => "Efecto de luz",
-        12 => "Color de luz",
-        13 => "Brillo +",
-        14 => "Brillo -",
-        15 => "Velocidad +",
-        16 => "Velocidad -",
-        17 => "Apagar luz",
-        18 => "Alt+Tab",
-        19 => "Win+E",
-        20 => "Win+Tab",
-        21 => "Win+H",
-        22 => "Bloquear Win",
-        _ => return None,
-    })
+    match crate::binding::function_label(id) {
+        "Función" => None,
+        name => Some(name),
+    }
 }
 
 fn media_name(usage: u16) -> Option<&'static str> {

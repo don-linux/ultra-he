@@ -1,14 +1,9 @@
 use crate::actuation;
-use crate::board::{self, load_read, tables_to_read, Board, Origin};
-use crate::dks;
+use crate::board::{load_read, tables_to_read, Board, Origin};
 use crate::endpoint::{Endpoint, Io};
 use crate::error::{Error, Result};
-use crate::frame::{
-    self, GET_MACRO, SET_ACTUATION, SET_COLOR, SET_DKS, SET_FN, SET_GLOBALS, SET_KEYS, SET_LIGHT,
-};
+use crate::frame::{self, GET_MACRO};
 use crate::globals;
-use crate::keys;
-use crate::lighting;
 
 pub fn download<T: Io>(endpoint: &mut Endpoint<T>) -> Result<Board> {
     let mut board = Board::default();
@@ -16,19 +11,22 @@ pub fn download<T: Io>(endpoint: &mut Endpoint<T>) -> Result<Board> {
         let bytes = endpoint.read_table(*cmd, *len)?;
         load_read(&mut board, *cmd, &bytes)?;
     }
+    board.dongle = endpoint.io.link().kind == crate::link::Kind::Dongle;
     board.raw_macros = read_macro_image(endpoint)?;
     board.macros_edited = false;
     board.origin = Origin::Device;
+    board.capture_snapshot()?;
     Ok(board)
 }
 
-pub fn upload<T: Io>(endpoint: &mut Endpoint<T>, board: &Board) -> Result<()> {
+/// Escribe solo las tablas distintas a la última lectura, en el orden de hec, y las relee.
+pub fn upload<T: Io>(endpoint: &mut Endpoint<T>, board: &mut Board) -> Result<()> {
     if !board.ready() {
         return Err(Error::NotReady);
     }
     board.validate()?;
-    for cmd in board.command_order() {
-        let data = payload(board, cmd)?;
+    for cmd in board.command_order()? {
+        let data = board.payload(cmd)?;
         if data.is_empty() {
             continue;
         }
@@ -38,28 +36,27 @@ pub fn upload<T: Io>(endpoint: &mut Endpoint<T>, board: &Board) -> Result<()> {
             return Err(Error::VerifyMismatch { cmd });
         }
     }
+    board.capture_snapshot()?;
     Ok(())
 }
 
-fn payload(board: &Board, cmd: u8) -> Result<Vec<u8>> {
-    Ok(match cmd {
-        SET_GLOBALS => board.globals.raw.to_vec(),
-        SET_ACTUATION => board.actuation_bytes()?.to_vec(),
-        SET_DKS => dks::encode_table(&board.dks).to_vec(),
-        frame::SET_MACRO => macro_payload(board)?,
-        SET_KEYS => keys::base_write_bytes(&board.base)?,
-        SET_FN => keys::fn_write_bytes(&board.fn_layer),
-        SET_LIGHT => board.lighting.encode()?.to_vec(),
-        SET_COLOR => lighting::encode_colors(&board.colors).to_vec(),
-        _ => return Err(Error::Protocol("comando de escritura desconocido")),
-    })
-}
-
-fn macro_payload(board: &Board) -> Result<Vec<u8>> {
-    if board.macros_edited || board.origin == Origin::File {
-        return board::macro_image(board);
-    }
-    Ok(board.raw_macros.clone())
+/// Carga un respaldo como cambios pendientes sobre una lectura nueva y escribe solo lo distinto.
+pub fn restore<T: Io>(endpoint: &mut Endpoint<T>, backup: &Board) -> Result<Board> {
+    let mut current = download(endpoint)?;
+    current.globals = backup.globals.clone();
+    current.actuation = backup.actuation;
+    current.choice = backup.choice;
+    current.base = backup.base;
+    current.fn_layer = backup.fn_layer;
+    current.dks = backup.dks;
+    current.macros = backup.macros.clone();
+    current.raw_macros = backup.raw_macros.clone();
+    current.macros_edited = backup.macros_edited;
+    current.lighting = backup.lighting;
+    current.colors = backup.colors;
+    current.origin = Origin::Device;
+    upload(endpoint, &mut current)?;
+    Ok(current)
 }
 
 fn read_macro_image<T: Io>(endpoint: &mut Endpoint<T>) -> Result<Vec<u8>> {

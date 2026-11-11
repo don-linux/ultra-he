@@ -16,7 +16,7 @@ use crate::macro_store::Event;
 use crate::switches::SwitchChoice;
 
 pub const FORMAT: &str = "mini60-config";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const HEC_PRODUCT: u64 = 32930;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -45,6 +45,12 @@ pub struct Profile {
     pub macros: Vec<MacroJson>,
     #[serde(default)]
     pub vendor_packs: Option<VendorPacks>,
+    /// Tablas crudas. Si vienen, ganan sobre los campos editados.
+    #[serde(default)]
+    pub raw: Option<RawTables>,
+    /// Vista para leer el archivo sin decodificar bytes.
+    #[serde(default)]
+    pub view: Vec<ViewKey>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -141,6 +147,39 @@ pub struct EventJson {
     pub delay_ms: u16,
     pub hid: u8,
     pub down: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RawTables {
+    #[serde(default)]
+    pub globals: Vec<u8>,
+    #[serde(default)]
+    pub actuation: Vec<u8>,
+    #[serde(default)]
+    pub base: Vec<u8>,
+    #[serde(default)]
+    pub fn_layer: Vec<u8>,
+    #[serde(default)]
+    pub dks: Vec<u8>,
+    #[serde(default)]
+    pub macros: Vec<u8>,
+    #[serde(default)]
+    pub light: Vec<u8>,
+    #[serde(default)]
+    pub colors: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ViewKey {
+    pub index: u16,
+    pub name: String,
+    pub switch: String,
+    pub actuation_mm: String,
+    pub rapid_trigger: bool,
+    pub press_mm: String,
+    pub release_mm: String,
+    pub base: String,
+    pub fn_layer: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -271,7 +310,47 @@ pub fn to_profile(board: &Board) -> Result<Profile> {
             all_color_pack: lighting::encode_colors(&board.colors).to_vec(),
             all_led_pack: board.lighting.encode()?.to_vec(),
         }),
+        raw: Some(raw_tables(board)?),
+        view: readable(board),
     })
+}
+
+fn raw_tables(board: &Board) -> Result<RawTables> {
+    Ok(RawTables {
+        globals: board.globals.raw.to_vec(),
+        actuation: actuation::encode_table(&board.actuation).to_vec(),
+        base: keys::encode_table(&board.base).to_vec(),
+        fn_layer: keys::fn_write_bytes(&board.fn_layer),
+        dks: dks::encode_table(&board.dks).to_vec(),
+        macros: if board.macros_edited || board.origin == Origin::File {
+            crate::board::macro_image(board).unwrap_or_default()
+        } else {
+            board.raw_macros.clone()
+        },
+        light: board.lighting.encode()?.to_vec(),
+        colors: lighting::encode_colors(&board.colors).to_vec(),
+    })
+}
+
+fn readable(board: &Board) -> Vec<ViewKey> {
+    crate::layout::keys()
+        .into_iter()
+        .map(|key| {
+            let index = key.index as usize;
+            let record = board.actuation[index];
+            ViewKey {
+                index: key.index,
+                name: key.label.to_string(),
+                switch: board.choice[index].label_with(board.default_axis),
+                actuation_mm: actuation::mm_text(record.display_trip()),
+                rapid_trigger: record.rt_enabled(),
+                press_mm: actuation::mm_text(record.rt_press),
+                release_mm: actuation::mm_text(record.rt_release),
+                base: crate::binding::label_of(board.base[index]),
+                fn_layer: crate::binding::label_of(board.fn_layer[index]),
+            }
+        })
+        .collect()
 }
 
 pub fn from_profile(profile: &Profile) -> Result<Board> {
@@ -280,7 +359,7 @@ pub fn from_profile(profile: &Profile) -> Result<Board> {
             "el archivo no es un perfil mini60-config".into(),
         ));
     }
-    if profile.version != VERSION {
+    if profile.version != 1 && profile.version != VERSION {
         return Err(Error::Json(format!(
             "versión {} no soportada",
             profile.version
@@ -299,6 +378,7 @@ pub fn from_profile(profile: &Profile) -> Result<Board> {
             pid,
             firmware: profile.device.firmware.clone(),
             battery: 0,
+            axial_model: 0,
         }),
         ..Board::default()
     };
@@ -338,17 +418,18 @@ pub fn from_profile(profile: &Profile) -> Result<Board> {
         }
         let choice = SwitchChoice::parse_profile(&item.switch_profile)?;
         board.choice[index] = choice;
-        let mut record = Record {
+        let record = Record {
             axis_type: choice.axis_byte(),
             flags: item.flags,
             trip: item.actuation_cmm,
             rt_press: item.rt_press_cmm,
             rt_release: item.rt_release_cmm,
         };
-        actuation::set_rt_enabled(&mut record, item.rt);
-        record.flags |= item.flags & actuation::FLAG_RAMPAGE;
         actuation::validate_record(choice, &record)?;
         board.actuation[index] = record;
+    }
+    if let Some(raw) = &profile.raw {
+        apply_raw(&mut board, raw)?;
     }
     apply_key_map(&mut board.base, &profile.keys)?;
     apply_key_map(&mut board.fn_layer, &profile.fn_layer)?;
@@ -511,6 +592,7 @@ pub fn from_hec(value: &Value) -> Result<Board> {
         pid: PID_WIRED,
         firmware: String::new(),
         battery: 0,
+        axial_model: 0,
     });
     Ok(board)
 }
@@ -568,17 +650,70 @@ fn parse_id(text: &str) -> Result<u16> {
     value.map_err(|_| Error::Json(format!("id {text}")))
 }
 
+fn apply_raw(board: &mut Board, raw: &RawTables) -> Result<()> {
+    if raw.globals.len() == crate::globals::TABLE {
+        board.globals = Globals::from_bytes(&raw.globals)?;
+    }
+    if raw.actuation.len() >= actuation::TABLE {
+        let choices = board.choice;
+        board.apply_actuation_bytes(
+            &raw.actuation[..actuation::TABLE],
+            &[false; actuation::RECORDS],
+        )?;
+        for (index, choice) in choices.into_iter().enumerate() {
+            if matches!(choice, SwitchChoice::JadeUltra | SwitchChoice::Default) {
+                board.choice[index] = choice;
+            }
+        }
+    }
+    if raw.base.len() >= keys::BASE_READ {
+        board.base = keys::decode_table(&raw.base)?;
+    }
+    if raw.fn_layer.len() >= keys::FN_BYTES {
+        board.fn_layer = keys::decode_table(&raw.fn_layer)?;
+    }
+    if raw.dks.len() >= dks::TABLE {
+        board.dks = dks::decode_table(&raw.dks)?;
+    }
+    if raw.light.len() >= lighting::BLOCK {
+        board.lighting = Lighting::decode(&raw.light)?;
+    }
+    if raw.colors.len() >= lighting::COLOR_TABLE {
+        board.colors = lighting::decode_colors(&raw.colors)?;
+    }
+    if !raw.macros.is_empty() {
+        board.raw_macros = raw.macros.clone();
+        board.macros_edited = false;
+    }
+    Ok(())
+}
+
+fn byte_of(item: &Value) -> Result<u8> {
+    let number = item
+        .as_u64()
+        .ok_or_else(|| Error::Json("byte no numérico".into()))?;
+    u8::try_from(number).map_err(|_| Error::Json(format!("byte {number} no cabe")))
+}
+
 fn number_array(value: &Value) -> Result<Vec<u8>> {
-    let array = value
-        .as_array()
-        .ok_or_else(|| Error::Json("se esperaba una lista de bytes".into()))?;
-    array
-        .iter()
-        .map(|item| {
-            let number = item
-                .as_u64()
-                .ok_or_else(|| Error::Json("byte no numérico".into()))?;
-            u8::try_from(number).map_err(|_| Error::Json(format!("byte {number} no cabe")))
-        })
-        .collect()
+    if let Some(array) = value.as_array() {
+        return array.iter().map(byte_of).collect();
+    }
+    let Some(object) = value.as_object() else {
+        return Err(Error::Json("se esperaba una lista de bytes".into()));
+    };
+    let mut pairs = Vec::with_capacity(object.len());
+    for (key, item) in object {
+        let index: usize = key
+            .parse()
+            .map_err(|_| Error::Json(format!("índice de pack {key}")))?;
+        pairs.push((index, byte_of(item)?));
+    }
+    pairs.sort_by_key(|(index, _)| *index);
+    let len = pairs.last().map(|(index, _)| index + 1).unwrap_or(0);
+    let mut out = vec![0u8; len];
+    for (index, byte) in pairs {
+        out[index] = byte;
+    }
+    Ok(out)
 }
