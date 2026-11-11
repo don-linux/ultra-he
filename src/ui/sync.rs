@@ -36,6 +36,10 @@ pub fn read_device(app: &mut App) {
                 .map(|path| format!(" Respaldo en {}.", path.display()))
                 .unwrap_or_default();
             app.status = format!("{}{}", firmware_status(&board), saved);
+            if let Some(warning) = board.warning.clone() {
+                app.status.push(' ');
+                app.status.push_str(&warning);
+            }
             if !mismatches.is_empty() {
                 app.status.push_str(&format!(
                     " {n} teclas marcadas como Jade Ultra no tienen el id 2.",
@@ -103,7 +107,10 @@ pub fn confirm(app: &mut App, ctx: &egui::Context) {
     }
     if accept {
         app.confirm_write = false;
-        write_device(app);
+        app.status = "Escribiendo en el teclado…".into();
+        app.io_job = super::IoJob::Write;
+        app.io_delay = 1;
+        ctx.request_repaint();
     }
 }
 
@@ -149,18 +156,11 @@ pub fn import_json(app: &mut App) {
         }
     };
     if app.board.origin == Origin::Device {
-        let snapshot = app.board.snapshot.clone();
-        let info = app.board.info.clone();
-        let dongle = app.board.dongle;
-        let default_axis = app.board.default_axis;
-        app.board = loaded;
-        app.board.snapshot = snapshot;
-        app.board.origin = Origin::Device;
-        app.board.dongle = dongle;
-        app.board.default_axis = default_axis;
-        if app.board.info.is_none() {
-            app.board.info = info;
+        if let Err(error) = app.board.overlay_present(&loaded) {
+            app.status = error.to_string();
+            return;
         }
+        app.switch_map.overlay(&mut app.board);
         app.status = format!(
             "Perfil cargado desde {} como cambios pendientes. {}",
             path.display(),
@@ -171,6 +171,7 @@ pub fn import_json(app: &mut App) {
     } else {
         app.board = loaded;
         app.board.snapshot = None;
+        app.switch_map.overlay(&mut app.board);
         app.status = format!(
             "Perfil cargado desde {}. Todavía no hay una lectura: escribir enviaría todas las tablas.",
             path.display()

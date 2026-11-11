@@ -12,18 +12,25 @@ pub struct Lighting {
     pub brightness: u8,
     pub speed: u8,
     pub direction: u8,
+    /// Bloque leído. `encode` reescribe solo los campos conocidos y conserva el resto.
+    pub raw: [u8; BLOCK],
 }
 
 impl Default for Lighting {
     fn default() -> Self {
-        Self {
+        let light = Self {
             mode: 1,
             color: [0x90, 0xEE, 0x90],
             color_mode: 0,
             brightness: 5,
             speed: 4,
             direction: 0,
-        }
+            raw: [0; BLOCK],
+        };
+        let Ok(raw) = light.encode() else {
+            return light;
+        };
+        Self { raw, ..light }
     }
 }
 
@@ -41,7 +48,7 @@ impl Lighting {
                 detail: self.speed.to_string(),
             });
         }
-        let mut out = [0u8; BLOCK];
+        let mut out = self.raw;
         out[0] = self.mode;
         out[1] = self.color[0];
         out[2] = self.color[1];
@@ -64,17 +71,20 @@ impl Lighting {
                 expected: BLOCK,
             });
         }
-        let mut mode = bytes[0];
+        let mut raw = [0u8; BLOCK];
+        raw.copy_from_slice(&bytes[..BLOCK]);
+        let mut mode = raw[0];
         if mode == 21 {
             mode = 0;
         }
         Ok(Self {
             mode,
-            color: [bytes[1], bytes[2], bytes[3]],
-            color_mode: bytes[8],
-            brightness: bytes[9],
-            speed: bytes[10],
-            direction: bytes[11],
+            color: [raw[1], raw[2], raw[3]],
+            color_mode: raw[8],
+            brightness: raw[9],
+            speed: raw[10],
+            direction: raw[11],
+            raw,
         })
     }
 }

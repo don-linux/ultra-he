@@ -348,6 +348,13 @@ impl SwitchChoice {
         }
     }
 
+    /// El mayor tope entre cable y receptor. Un archivo no sabe por dónde se leyó.
+    pub fn widest_cap(self, default_axis: u8) -> Result<u16> {
+        Ok(self
+            .cap(false, default_axis)?
+            .max(self.cap(true, default_axis)?))
+    }
+
     pub fn label(self) -> String {
         self.label_with(FALLBACK_AXIS)
     }

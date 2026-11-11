@@ -19,6 +19,50 @@ pub enum Origin {
     File,
 }
 
+/// Tablas que venían en un archivo. Una importación copia solo estas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableSet {
+    pub actuation: bool,
+    pub base: bool,
+    pub fn_layer: bool,
+    pub dks: bool,
+    pub globals: bool,
+    pub dead_zone: bool,
+    pub lighting: bool,
+    pub colors: bool,
+    pub macros: bool,
+}
+
+impl TableSet {
+    pub const fn none() -> Self {
+        Self {
+            actuation: false,
+            base: false,
+            fn_layer: false,
+            dks: false,
+            globals: false,
+            dead_zone: false,
+            lighting: false,
+            colors: false,
+            macros: false,
+        }
+    }
+
+    pub const fn all() -> Self {
+        Self {
+            actuation: true,
+            base: true,
+            fn_layer: true,
+            dks: true,
+            globals: true,
+            dead_zone: false,
+            lighting: true,
+            colors: true,
+            macros: true,
+        }
+    }
+}
+
 /// Copia de las tablas tal como se escribirían. Sirve para saber qué cambió.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -68,6 +112,9 @@ pub struct Board {
     pub macros_edited: bool,
     pub lighting: Lighting,
     pub colors: [[u8; 3]; lighting::COLOR_RECORDS],
+    pub present: TableSet,
+    /// La lectura terminó, pero una tabla no se pudo re-codificar.
+    pub warning: Option<String>,
 }
 
 impl Default for Board {
@@ -89,6 +136,8 @@ impl Default for Board {
             macros_edited: false,
             lighting: Lighting::default(),
             colors: [[0x90, 0xEE, 0x90]; lighting::COLOR_RECORDS],
+            present: TableSet::none(),
+            warning: None,
         }
     }
 }
@@ -181,10 +230,48 @@ impl Board {
 
     pub fn validate(&self) -> Result<()> {
         for (index, record) in self.actuation.iter().enumerate() {
-            actuation::validate_record(self.choice[index], record)?;
+            let choice = self.choice[index];
+            let max = self.cap_of(choice)?;
+            actuation::validate_record(choice, record, max)?;
         }
         // La tabla DKS tiene 64 ranuras. La 63 no se puede asignar a una tecla
         // nueva, pero el firmware la devuelve y hay que conservarla.
+        Ok(())
+    }
+
+    /// Copia las tablas que el archivo traía. El snapshot y el enlace se quedan.
+    pub fn overlay_present(&mut self, incoming: &Board) -> Result<()> {
+        if incoming.present.globals {
+            self.globals = incoming.globals.clone();
+        } else if incoming.present.dead_zone {
+            self.globals.set_top_dead(incoming.globals.top_dead_cmm())?;
+            self.globals
+                .set_bottom_dead(incoming.globals.bottom_dead_cmm())?;
+        }
+        if incoming.present.actuation {
+            self.actuation = incoming.actuation;
+            self.choice = incoming.choice;
+        }
+        if incoming.present.base {
+            self.base = incoming.base;
+        }
+        if incoming.present.fn_layer {
+            self.fn_layer = incoming.fn_layer;
+        }
+        if incoming.present.dks {
+            self.dks = incoming.dks;
+        }
+        if incoming.present.lighting {
+            self.lighting = incoming.lighting;
+        }
+        if incoming.present.colors {
+            self.colors = incoming.colors;
+        }
+        if incoming.present.macros {
+            self.macros = incoming.macros.clone();
+            self.raw_macros = incoming.raw_macros.clone();
+            self.macros_edited = incoming.macros_edited;
+        }
         Ok(())
     }
 
@@ -209,14 +296,25 @@ impl Board {
         };
         let mut order = Vec::new();
         for cmd in candidates {
-            if self.payload(cmd)? != snapshot.bytes(cmd) {
+            if cmd == SET_LIGHT {
+                if let Ok(bytes) = self.lighting.encode() {
+                    if bytes.as_slice() != snapshot.light {
+                        order.push(SET_LIGHT);
+                    }
+                }
+                continue;
+            }
+            let data = self.payload(cmd)?;
+            if cmd == frame::SET_MACRO && data.is_empty() {
+                continue;
+            }
+            if data != snapshot.bytes(cmd) {
                 order.push(cmd);
             }
         }
         if self.lighting.mode == 20 {
             let colors = self.payload(SET_COLOR)?;
-            let light_changed = self.payload(SET_LIGHT)? != snapshot.light;
-            if colors != snapshot.colors || light_changed {
+            if colors != snapshot.colors {
                 order.push(SET_COLOR);
             }
         }
@@ -229,7 +327,7 @@ impl Board {
             SET_ACTUATION => self.actuation_bytes()?.to_vec(),
             SET_DKS => dks::encode_table(&self.dks).to_vec(),
             frame::SET_MACRO => {
-                if self.macros_edited || self.origin == Origin::File {
+                if self.macros_edited {
                     macro_image(self)?
                 } else {
                     self.raw_macros.clone()
@@ -244,14 +342,32 @@ impl Board {
     }
 
     pub fn capture_snapshot(&mut self) -> Result<()> {
+        let light = match self.lighting.encode() {
+            Ok(bytes) => {
+                self.warning = None;
+                bytes.to_vec()
+            }
+            Err(error) => {
+                self.warning = Some(error.to_string());
+                self.lighting.raw.to_vec()
+            }
+        };
+        let macros = match self.payload(frame::SET_MACRO)? {
+            data if data.is_empty() => self
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.macros.clone())
+                .unwrap_or_default(),
+            data => data,
+        };
         self.snapshot = Some(Snapshot {
             globals: self.payload(SET_GLOBALS)?,
             actuation: self.payload(SET_ACTUATION)?,
             dks: self.payload(SET_DKS)?,
-            macros: self.payload(frame::SET_MACRO)?,
+            macros,
             base: self.payload(SET_KEYS)?,
             fn_layer: self.payload(SET_FN)?,
-            light: self.payload(SET_LIGHT)?,
+            light,
             colors: self.payload(SET_COLOR)?,
         });
         Ok(())

@@ -34,6 +34,29 @@ pub fn ensure_allowed(cmd: u8) -> Result<()> {
     }
 }
 
+/// Lectura que corresponde a un `SET`. Solo los ocho pares que hekit escribe.
+pub fn get_for(set: u8) -> Result<u8> {
+    let get = match set {
+        SET_GLOBALS => GET_GLOBALS,
+        SET_KEYS => GET_KEYS,
+        SET_LIGHT => GET_LIGHT,
+        SET_COLOR => GET_COLOR,
+        SET_MACRO => GET_MACRO,
+        SET_FN => GET_FN,
+        SET_ACTUATION => GET_ACTUATION,
+        SET_DKS => GET_DKS,
+        _ => return Err(Error::Protocol("el comando no tiene lectura pareja")),
+    };
+    Ok(get)
+}
+
+fn offset_u16(offset: usize) -> Result<u16> {
+    u16::try_from(offset).map_err(|_| Error::OutOfRange {
+        field: "offset",
+        detail: format!("{offset}, máximo {}", u16::MAX),
+    })
+}
+
 pub fn chunk_size(frame_len: usize) -> usize {
     frame_len.saturating_sub(HEADER)
 }
@@ -84,7 +107,7 @@ pub fn paginate(frame_len: usize, cmd: u8, data: &[u8]) -> Result<Vec<Vec<u8>>> 
         out.push(build_request(
             frame_len,
             cmd,
-            offset as u16,
+            offset_u16(offset)?,
             &data[offset..end],
             last,
         )?);
@@ -108,7 +131,7 @@ pub fn read_requests(frame_len: usize, cmd: u8, total: usize) -> Result<Vec<Vec<
         out.push(build_request(
             frame_len,
             cmd,
-            offset as u16,
+            offset_u16(offset)?,
             &vec![0u8; n],
             last,
         )?);
@@ -152,10 +175,6 @@ pub fn parse_reply(buf: &[u8], expect_cmd: u8, expect_offset: u16) -> Result<&[u
     Ok(&buf[HEADER..end])
 }
 
-pub fn frame_command(frame: &[u8]) -> Option<u8> {
-    frame.get(1).copied()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +200,26 @@ mod tests {
         assert_eq!(frames[1][4], 0x00);
         assert_eq!(frames[1][2], 8);
         assert_eq!(frames[1][6], 1);
+    }
+
+    #[test]
+    fn get_for_pairs_each_set_and_rejects_the_rest() {
+        assert_eq!(get_for(SET_GLOBALS).unwrap(), GET_GLOBALS);
+        assert_eq!(get_for(SET_KEYS).unwrap(), GET_KEYS);
+        assert_eq!(get_for(SET_LIGHT).unwrap(), GET_LIGHT);
+        assert_eq!(get_for(SET_COLOR).unwrap(), GET_COLOR);
+        assert_eq!(get_for(SET_MACRO).unwrap(), GET_MACRO);
+        assert_eq!(get_for(SET_FN).unwrap(), GET_FN);
+        assert_eq!(get_for(SET_ACTUATION).unwrap(), GET_ACTUATION);
+        assert_eq!(get_for(SET_DKS).unwrap(), GET_DKS);
+        assert!(get_for(GET_LIGHT).is_err());
+        assert!(get_for(0x0F).is_err());
+    }
+
+    #[test]
+    fn paginate_rejects_an_offset_past_u16() {
+        let chunk = chunk_size(WIRED_FRAME);
+        let data = vec![0u8; chunk * (usize::from(u16::MAX) / chunk + 1) + 1];
+        assert!(paginate(WIRED_FRAME, SET_KEYS, &data).is_err());
     }
 }

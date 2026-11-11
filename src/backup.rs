@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::actuation;
-use crate::board::{Board, Origin};
+use crate::board::{Board, Origin, TableSet};
 use crate::dks;
 use crate::error::{Error, Result};
 use crate::globals::Globals;
@@ -39,11 +39,11 @@ struct File {
 pub fn save(board: &Board) -> Result<PathBuf> {
     let dir = backup_dir()?;
     fs::create_dir_all(&dir).map_err(|error| Error::Io(error.to_string()))?;
-    let secs = SystemTime::now()
+    let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
+        .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    let path = dir.join(format!("backup-{secs}.json"));
+    let path = dir.join(format!("backup-{stamp}.json"));
     save_to(board, &path)?;
     Ok(path)
 }
@@ -80,7 +80,11 @@ pub fn save_to(board: &Board, path: &Path) -> Result<()> {
         base: keys::encode_table(&board.base).to_vec(),
         fn_layer: keys::fn_write_bytes(&board.fn_layer),
         dks: dks::encode_table(&board.dks).to_vec(),
-        macros: board.raw_macros.clone(),
+        macros: if board.macros_edited {
+            crate::board::macro_image(board)?
+        } else {
+            board.raw_macros.clone()
+        },
         light: board.lighting.encode()?.to_vec(),
         colors: lighting::encode_colors(&board.colors).to_vec(),
     };
@@ -114,7 +118,7 @@ pub fn parse(text: &str) -> Result<Board> {
     };
     board.actuation = actuation::decode_table(&file.actuation)?;
     board.base = keys::decode_table(&file.base)?;
-    board.fn_layer = keys::decode_table(&pad_fn(&file.fn_layer))?;
+    board.fn_layer = keys::decode_table(&file.fn_layer)?;
     board.dks = dks::decode_table(&file.dks)?;
     board.lighting = Lighting::decode(&file.light)?;
     board.colors = lighting::decode_colors(&file.colors)?;
@@ -125,15 +129,8 @@ pub fn parse(text: &str) -> Result<Board> {
         }
         board.choice[index] = SwitchChoice::parse_profile(key)?;
     }
+    board.present = TableSet::all();
     Ok(board)
-}
-
-fn pad_fn(bytes: &[u8]) -> Vec<u8> {
-    let mut out = bytes.to_vec();
-    if out.len() < keys::FN_BYTES {
-        out.resize(keys::FN_BYTES, 0);
-    }
-    out
 }
 
 pub fn backup_dir() -> Result<PathBuf> {

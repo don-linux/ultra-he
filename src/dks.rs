@@ -13,6 +13,8 @@ pub struct Slot {
     pub reset: u8,
     pub actions: [u8; 4],
     pub masks: [u8; 4],
+    /// Bytes 4, 6, 8 y 10. El driver no los nombra; se conservan.
+    pub gaps: [u8; 4],
 }
 
 impl Default for Slot {
@@ -24,6 +26,7 @@ impl Default for Slot {
             reset: 16,
             actions: [0; 4],
             masks: [0; 4],
+            gaps: [0; 4],
         }
     }
 }
@@ -35,9 +38,13 @@ impl Slot {
         out[1] = self.bottom;
         out[2] = self.release;
         out[3] = self.reset;
+        out[4] = self.gaps[0];
         out[5] = self.actions[0];
+        out[6] = self.gaps[1];
         out[7] = self.actions[1];
+        out[8] = self.gaps[2];
         out[9] = self.actions[2];
+        out[10] = self.gaps[3];
         out[11] = self.actions[3];
         out[12..16].copy_from_slice(&self.masks);
         out
@@ -58,6 +65,7 @@ impl Slot {
             reset: raw[3],
             actions: [raw[5], raw[7], raw[9], raw[11]],
             masks: [raw[12], raw[13], raw[14], raw[15]],
+            gaps: [raw[4], raw[6], raw[8], raw[10]],
         })
     }
 }

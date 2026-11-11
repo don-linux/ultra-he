@@ -306,7 +306,7 @@ pub fn to_profile(board: &Board) -> Result<Profile> {
                 padded
             },
             all_dks_pack: dks::encode_table(&board.dks).to_vec(),
-            all_macro_pack: crate::board::macro_image(board).unwrap_or_default(),
+            all_macro_pack: macro_bytes(board)?,
             all_color_pack: lighting::encode_colors(&board.colors).to_vec(),
             all_led_pack: board.lighting.encode()?.to_vec(),
         }),
@@ -322,11 +322,7 @@ fn raw_tables(board: &Board) -> Result<RawTables> {
         base: keys::encode_table(&board.base).to_vec(),
         fn_layer: keys::fn_write_bytes(&board.fn_layer),
         dks: dks::encode_table(&board.dks).to_vec(),
-        macros: if board.macros_edited || board.origin == Origin::File {
-            crate::board::macro_image(board).unwrap_or_default()
-        } else {
-            board.raw_macros.clone()
-        },
+        macros: macro_bytes(board)?,
         light: board.lighting.encode()?.to_vec(),
         colors: lighting::encode_colors(&board.colors).to_vec(),
     })
@@ -397,15 +393,18 @@ pub fn from_profile(profile: &Profile) -> Result<Board> {
     board
         .globals
         .set_auto_calibration(profile.system.auto_calibration);
-    board.lighting = Lighting {
+    let mut lighting = Lighting {
         mode: profile.lighting.mode,
         color: profile.lighting.color,
         color_mode: profile.lighting.color_mode,
         brightness: profile.lighting.brightness,
         speed: profile.lighting.speed,
         direction: profile.lighting.direction,
+        raw: [0; lighting::BLOCK],
     };
-    board.lighting.encode()?;
+    let raw = lighting.encode()?;
+    lighting.raw = raw;
+    board.lighting = lighting;
     for (index, color) in &profile.per_key_color {
         if *index < lighting::COLOR_RECORDS as u16 {
             board.colors[*index as usize] = *color;
@@ -425,7 +424,7 @@ pub fn from_profile(profile: &Profile) -> Result<Board> {
             rt_press: item.rt_press_cmm,
             rt_release: item.rt_release_cmm,
         };
-        actuation::validate_record(choice, &record)?;
+        actuation::validate_record(choice, &record, choice.widest_cap(board.default_axis)?)?;
         board.actuation[index] = record;
     }
     if let Some(raw) = &profile.raw {
@@ -451,6 +450,7 @@ pub fn from_profile(profile: &Profile) -> Result<Board> {
     }
     for item in &profile.dks {
         dks::check_slot(item.slot)?;
+        let gaps = board.dks[item.slot as usize].gaps;
         board.dks[item.slot as usize] = Slot {
             press: item.press,
             bottom: item.bottom,
@@ -458,6 +458,7 @@ pub fn from_profile(profile: &Profile) -> Result<Board> {
             reset: item.reset,
             actions: item.actions,
             masks: item.masks,
+            gaps,
         };
     }
     board.macros = profile
@@ -475,7 +476,11 @@ pub fn from_profile(profile: &Profile) -> Result<Board> {
                 .collect()
         })
         .collect();
-    board.validate()?;
+    if board.raw_macros.is_empty() && !board.macros.is_empty() {
+        board.macros_edited = true;
+    }
+    board.present = crate::board::TableSet::all();
+    validate_file(&board)?;
     Ok(board)
 }
 
@@ -494,6 +499,16 @@ pub fn from_hec(value: &Value) -> Result<Board> {
     let packs = value
         .as_object()
         .ok_or_else(|| Error::Json("el perfil no es un objeto".into()))?;
+    if let Some(product) = packs.get("productId") {
+        let Some(product) = product.as_u64() else {
+            return Err(Error::Json("product id no numérico".into()));
+        };
+        if product != HEC_PRODUCT && product != u64::from(PID_WIRED) {
+            return Err(Error::Json(format!(
+                "product id {product} no es el MINI 60 HE PRO"
+            )));
+        }
+    }
     if !packs.contains_key("RTlist") && !packs.contains_key("rt_list") {
         return Err(Error::Json("el perfil hec no trae RTlist".into()));
     }
@@ -501,7 +516,7 @@ pub fn from_hec(value: &Value) -> Result<Board> {
         packs
             .get("RTlist")
             .or_else(|| packs.get("rt_list"))
-            .unwrap(),
+            .ok_or_else(|| Error::Json("el perfil hec no trae RTlist".into()))?,
     )?;
     if rt.len() < actuation::TABLE {
         return Err(Error::BadLength {
@@ -510,6 +525,8 @@ pub fn from_hec(value: &Value) -> Result<Board> {
             expected: actuation::TABLE,
         });
     }
+    let mut present = crate::board::TableSet::none();
+    present.actuation = true;
     let mut board = Board {
         origin: Origin::File,
         ..Board::default()
@@ -526,6 +543,7 @@ pub fn from_hec(value: &Value) -> Result<Board> {
             });
         }
         board.fn_layer = keys::decode_table(&bytes)?;
+        present.fn_layer = true;
     }
     if let Some(raw) = packs
         .get("allKeyPack")
@@ -540,51 +558,61 @@ pub fn from_hec(value: &Value) -> Result<Board> {
             });
         }
         board.base = keys::decode_table(&bytes)?;
+        present.base = true;
     }
     if let Some(raw) = packs
         .get("allDksPack")
         .or_else(|| packs.get("all_dks_pack"))
     {
         let bytes = number_array(raw)?;
-        if bytes.len() >= dks::TABLE {
-            board.dks = dks::decode_table(&bytes)?;
-        }
+        require_len(&bytes, "allDksPack", dks::TABLE)?;
+        board.dks = dks::decode_table(&bytes)?;
+        present.dks = true;
     }
     if let Some(raw) = packs
         .get("allledPack")
         .or_else(|| packs.get("all_led_pack"))
     {
         let bytes = number_array(raw)?;
-        if bytes.len() >= lighting::BLOCK {
-            board.lighting = Lighting::decode(&bytes)?;
-        }
+        require_len(&bytes, "allledPack", lighting::BLOCK)?;
+        board.lighting = Lighting::decode(&bytes)?;
+        present.lighting = true;
     }
     if let Some(raw) = packs
         .get("allColorPack")
         .or_else(|| packs.get("all_color_pack"))
     {
         let bytes = number_array(raw)?;
-        if bytes.len() >= lighting::COLOR_TABLE {
-            board.colors = lighting::decode_colors(&bytes)?;
-        }
+        require_len(&bytes, "allColorPack", lighting::COLOR_TABLE)?;
+        board.colors = lighting::decode_colors(&bytes)?;
+        present.colors = true;
+    }
+    if let Some(raw) = packs
+        .get("allMacroPack")
+        .or_else(|| packs.get("all_macro_pack"))
+    {
+        let bytes = number_array(raw)?;
+        require_len(&bytes, "allMacroPack", crate::macro_store::DIRECTORY)?;
+        board.raw_macros = bytes;
+        board.macros_edited = false;
+        present.macros = true;
     }
     if let Some(zone) = packs.get("zone").and_then(Value::as_object) {
         if let Some(top) = zone.get("topValue").and_then(Value::as_u64) {
-            board
-                .globals
-                .set_top_dead(u8::try_from(top).unwrap_or(255))?;
+            let top = u8::try_from(top).map_err(|_| Error::OutOfRange {
+                field: "zona muerta superior",
+                detail: top.to_string(),
+            })?;
+            board.globals.set_top_dead(top)?;
+            present.dead_zone = true;
         }
         if let Some(bottom) = zone.get("bottomValue").and_then(Value::as_u64) {
-            board
-                .globals
-                .set_bottom_dead(u8::try_from(bottom).unwrap_or(255))?;
-        }
-    }
-    if let Some(product) = packs.get("productId").and_then(Value::as_u64) {
-        if product != HEC_PRODUCT && product != PID_WIRED as u64 {
-            return Err(Error::Json(format!(
-                "product id {product} no es el MINI 60 HE PRO"
-            )));
+            let bottom = u8::try_from(bottom).map_err(|_| Error::OutOfRange {
+                field: "zona muerta inferior",
+                detail: bottom.to_string(),
+            })?;
+            board.globals.set_bottom_dead(bottom)?;
+            present.dead_zone = true;
         }
     }
     board.info = Some(DeviceInfo {
@@ -594,7 +622,37 @@ pub fn from_hec(value: &Value) -> Result<Board> {
         battery: 0,
         axial_model: 0,
     });
+    board.present = present;
     Ok(board)
+}
+
+fn require_len(bytes: &[u8], what: &'static str, expected: usize) -> Result<()> {
+    if bytes.len() < expected {
+        Err(Error::BadLength {
+            what,
+            got: bytes.len(),
+            expected,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_file(board: &Board) -> Result<()> {
+    for (index, record) in board.actuation.iter().enumerate() {
+        let choice = board.choice[index];
+        let max = choice.widest_cap(board.default_axis)?;
+        actuation::validate_record(choice, record, max)?;
+    }
+    Ok(())
+}
+
+fn macro_bytes(board: &Board) -> Result<Vec<u8>> {
+    if board.macros_edited {
+        crate::board::macro_image(board)
+    } else {
+        Ok(board.raw_macros.clone())
+    }
 }
 
 pub fn to_pretty(board: &Board) -> Result<String> {
@@ -651,10 +709,12 @@ fn parse_id(text: &str) -> Result<u16> {
 }
 
 fn apply_raw(board: &mut Board, raw: &RawTables) -> Result<()> {
-    if raw.globals.len() == crate::globals::TABLE {
+    if !raw.globals.is_empty() {
+        require_len(&raw.globals, "tabla global", crate::globals::TABLE)?;
         board.globals = Globals::from_bytes(&raw.globals)?;
     }
-    if raw.actuation.len() >= actuation::TABLE {
+    if !raw.actuation.is_empty() {
+        require_len(&raw.actuation, "tabla de actuación", actuation::TABLE)?;
         let choices = board.choice;
         board.apply_actuation_bytes(
             &raw.actuation[..actuation::TABLE],
@@ -666,22 +726,28 @@ fn apply_raw(board: &mut Board, raw: &RawTables) -> Result<()> {
             }
         }
     }
-    if raw.base.len() >= keys::BASE_READ {
+    if !raw.base.is_empty() {
+        require_len(&raw.base, "tabla de teclas", keys::BASE_READ)?;
         board.base = keys::decode_table(&raw.base)?;
     }
-    if raw.fn_layer.len() >= keys::FN_BYTES {
+    if !raw.fn_layer.is_empty() {
+        require_len(&raw.fn_layer, "capa Fn", keys::FN_BYTES)?;
         board.fn_layer = keys::decode_table(&raw.fn_layer)?;
     }
-    if raw.dks.len() >= dks::TABLE {
+    if !raw.dks.is_empty() {
+        require_len(&raw.dks, "tabla DKS", dks::TABLE)?;
         board.dks = dks::decode_table(&raw.dks)?;
     }
-    if raw.light.len() >= lighting::BLOCK {
+    if !raw.light.is_empty() {
+        require_len(&raw.light, "bloque de luz", lighting::BLOCK)?;
         board.lighting = Lighting::decode(&raw.light)?;
     }
-    if raw.colors.len() >= lighting::COLOR_TABLE {
+    if !raw.colors.is_empty() {
+        require_len(&raw.colors, "colores por tecla", lighting::COLOR_TABLE)?;
         board.colors = lighting::decode_colors(&raw.colors)?;
     }
     if !raw.macros.is_empty() {
+        require_len(&raw.macros, "macros", crate::macro_store::DIRECTORY)?;
         board.raw_macros = raw.macros.clone();
         board.macros_edited = false;
     }

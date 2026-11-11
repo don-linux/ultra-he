@@ -1,11 +1,11 @@
 use hekit::actuation::{self, Record};
-use hekit::board::Board;
+use hekit::board::{Board, Origin};
 use hekit::dks;
 use hekit::endpoint::{Endpoint, MockIo};
 use hekit::error::Error;
 use hekit::frame::{
-    self, DONGLE_FRAME, SET_ACTUATION, SET_COLOR, SET_DKS, SET_FN, SET_GLOBALS, SET_KEYS,
-    SET_LIGHT, WIRED_FRAME,
+    self, DONGLE_FRAME, GET_MACRO, SET_ACTUATION, SET_COLOR, SET_DKS, SET_FN, SET_GLOBALS,
+    SET_KEYS, SET_LIGHT, SET_MACRO, WIRED_FRAME,
 };
 use hekit::globals::Globals;
 use hekit::keys::{self, KeyRecord};
@@ -280,7 +280,7 @@ fn rapid_trigger_is_on_only_when_both_distances_are_set() {
 }
 
 #[test]
-fn disabling_rt_writes_zero_and_clears_travel_bits() {
+fn disabling_rt_writes_zero_and_keeps_the_hidden_bits() {
     let mut record = Record {
         flags: actuation::FLAG_FULL_TRAVEL | actuation::FLAG_BOTTOM_OPT | actuation::FLAG_RAMPAGE,
         ..Record::default()
@@ -289,7 +289,7 @@ fn disabling_rt_writes_zero_and_clears_travel_bits() {
     assert_eq!(record.rt_press, 0);
     assert_eq!(record.rt_release, 0);
     assert_eq!(record.flags & actuation::FLAG_FULL_TRAVEL, 0);
-    assert_eq!(record.flags & actuation::FLAG_BOTTOM_OPT, 0);
+    assert_ne!(record.flags & actuation::FLAG_BOTTOM_OPT, 0);
     assert_ne!(record.flags & actuation::FLAG_RAMPAGE, 0);
 }
 
@@ -823,4 +823,149 @@ fn version_1_profile_still_imports() {
         .replace("\"version\": 2", "\"version\": 1");
     let loaded = profile::parse_document(&text).unwrap();
     assert_eq!(loaded.actuation[0].trip, board.actuation[0].trip);
+}
+
+fn rt_list_zeros() -> Vec<u8> {
+    vec![0u8; actuation::TABLE]
+}
+
+#[test]
+fn partial_hec_over_a_read_dirties_only_actuation() {
+    let mut board = wired_board();
+    board.base[0] = keys::keyboard(0, 0x04);
+    board.lighting.mode = 4;
+    board.capture_snapshot().unwrap();
+    let loaded =
+        profile::parse_document(&serde_json::json!({ "RTlist": rt_list_zeros() }).to_string())
+            .unwrap();
+    board.overlay_present(&loaded).unwrap();
+    let order = board.command_order().unwrap();
+    assert_eq!(order, vec![SET_ACTUATION]);
+    assert_eq!(board.base[0], keys::keyboard(0, 0x04));
+    assert_eq!(board.lighting.mode, 4);
+}
+
+#[test]
+fn short_dks_pack_is_rejected() {
+    let json = serde_json::json!({
+        "RTlist": rt_list_zeros(),
+        "allDksPack": [1, 2, 3],
+    });
+    assert!(profile::parse_document(&json.to_string()).is_err());
+}
+
+#[test]
+fn hec_macro_pack_round_trip() {
+    let events = vec![vec![Event {
+        delay_ms: 12,
+        hid: 0x05,
+        down: true,
+    }]];
+    let image = macro_store::encode_image(&events).unwrap();
+    let json = serde_json::json!({
+        "RTlist": rt_list_zeros(),
+        "allMacroPack": image,
+    });
+    let board = profile::parse_document(&json.to_string()).unwrap();
+    assert!(board.present.macros);
+    assert!(!board.present.base);
+    assert_eq!(board.raw_macros, image);
+    assert!(!board.macros_edited);
+    assert_eq!(board.payload(SET_MACRO).unwrap(), image);
+}
+
+#[test]
+fn file_raw_macros_are_not_replaced_by_an_empty_directory() {
+    let events = vec![vec![Event {
+        delay_ms: 8,
+        hid: 0x04,
+        down: false,
+    }]];
+    let image = macro_store::encode_image(&events).unwrap();
+    let mut board = wired_board();
+    board.origin = Origin::File;
+    board.raw_macros = image.clone();
+    board.macros.clear();
+    board.macros_edited = false;
+    assert_eq!(board.payload(SET_MACRO).unwrap(), image);
+}
+
+#[test]
+fn mode_20_color_change_does_not_resend_the_light_block() {
+    let mut board = wired_board();
+    board.lighting.mode = 20;
+    board.capture_snapshot().unwrap();
+    board.colors[17] = [1, 2, 3];
+    assert_eq!(board.command_order().unwrap(), vec![SET_COLOR]);
+}
+
+#[test]
+fn mode_20_brightness_change_does_not_resend_colors() {
+    let mut board = wired_board();
+    board.lighting.mode = 20;
+    board.capture_snapshot().unwrap();
+    board.lighting.brightness = 2;
+    assert_eq!(board.command_order().unwrap(), vec![SET_LIGHT]);
+}
+
+#[test]
+fn light_byte_5_survives_a_brightness_change() {
+    let mut raw = Lighting::default().encode().unwrap();
+    raw[5] = 0x3C;
+    let mut light = Lighting::decode(&raw).unwrap();
+    light.brightness = 3;
+    let out = light.encode().unwrap();
+    assert_eq!(out[5], 0x3C);
+    assert_eq!(out[9], 3);
+}
+
+#[test]
+fn short_read_chunk_is_rejected() {
+    let mut mock = MockIo::wired();
+    mock.reply_len = Some(0);
+    let mut endpoint = Endpoint::new(mock);
+    assert!(matches!(
+        endpoint.read_table(0x17, 8),
+        Err(Error::BadLength { .. })
+    ));
+}
+
+#[test]
+fn macro_offset_past_u16_is_rejected() {
+    let mut directory = vec![0u8; macro_store::DIRECTORY];
+    directory[..4].copy_from_slice(&70_000u32.to_le_bytes());
+    let mock = MockIo::wired().with_table(GET_MACRO, directory);
+    let mut endpoint = Endpoint::new(mock);
+    assert!(sync::download(&mut endpoint).is_err());
+}
+
+#[test]
+fn decode_image_round_trips_encode_image() {
+    let events = vec![
+        vec![Event {
+            delay_ms: 10,
+            hid: 0x04,
+            down: true,
+        }],
+        Vec::new(),
+        vec![Event {
+            delay_ms: 20,
+            hid: 0x05,
+            down: false,
+        }],
+    ];
+    let bytes = macro_store::encode_image(&events).unwrap();
+    assert_eq!(macro_store::decode_image(&bytes).unwrap(), events);
+}
+
+#[test]
+fn dks_gap_bytes_survive_a_round_trip() {
+    let mut raw = [0u8; dks::SLOT_BYTES];
+    raw[4] = 9;
+    raw[6] = 8;
+    raw[8] = 7;
+    raw[10] = 6;
+    let slot = dks::Slot::decode(&raw).unwrap();
+    assert_eq!(slot.encode()[4], 9);
+    assert_eq!(slot.encode()[10], 6);
 }

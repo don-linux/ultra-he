@@ -23,18 +23,29 @@ impl<T: Io> Endpoint<T> {
     }
 
     pub fn write_frame(&mut self, frame: &[u8]) -> Result<()> {
+        let cmd = *frame.get(1).ok_or(Error::Protocol("trama corta"))?;
+        frame::ensure_allowed(cmd)?;
         link::accept_frame(self.io.link(), frame)?;
         self.io.write(&prepend_report_id(frame))
     }
 
     fn read_chunk(&mut self, request: &[u8]) -> Result<Vec<u8>> {
-        let cmd = request[1];
-        let offset = u16::from_le_bytes([request[3], request[4]]);
+        let (cmd, offset, expected) = request_fields(request)?;
         for _ in 0..3 {
             self.write_frame(request)?;
             match self.io.read(500)? {
                 Read::Timeout => continue,
-                Read::Data(buf) => return Ok(parse_reply(&buf, cmd, offset)?.to_vec()),
+                Read::Data(buf) => {
+                    let payload = parse_reply(&buf, cmd, offset)?;
+                    if payload.len() != expected {
+                        return Err(Error::BadLength {
+                            what: "trozo",
+                            got: payload.len(),
+                            expected,
+                        });
+                    }
+                    return Ok(payload.to_vec());
+                }
             }
         }
         Err(Error::Timeout)
@@ -44,15 +55,18 @@ impl<T: Io> Endpoint<T> {
         let requests = frame::read_requests(self.io.link().frame_len, cmd, total)?;
         let mut out = vec![0u8; total];
         for request in requests {
-            let offset = u16::from_le_bytes([request[3], request[4]]) as usize;
+            let (_, offset, expected) = request_fields(&request)?;
             let payload = self.read_chunk(&request)?;
-            let end = offset + payload.len();
-            if end > out.len() {
-                return Err(Error::Protocol(
-                    "el teclado devolvió más bytes de los pedidos",
-                ));
+            let start = usize::from(offset);
+            let end = start + payload.len();
+            if payload.len() != expected || end > out.len() {
+                return Err(Error::BadLength {
+                    what: "trozo",
+                    got: payload.len(),
+                    expected,
+                });
             }
-            out[offset..end].copy_from_slice(&payload);
+            out[start..end].copy_from_slice(&payload);
         }
         Ok(out)
     }
@@ -61,7 +75,7 @@ impl<T: Io> Endpoint<T> {
         let frames = frame::paginate(self.io.link().frame_len, cmd, data)?;
         for frame in frames {
             self.write_frame(&frame)?;
-            let offset = u16::from_le_bytes([frame[3], frame[4]]);
+            let (_, offset, _) = request_fields(&frame)?;
             match self.io.read(500) {
                 Ok(Read::Data(buf)) => {
                     parse_reply(&buf, cmd, offset)?;
@@ -108,6 +122,8 @@ pub struct MockIo {
     pub frames: Vec<Vec<u8>>,
     pub timeouts: u32,
     pub fatal: bool,
+    /// Si está puesto, la respuesta trae como mucho estos bytes de payload.
+    pub reply_len: Option<usize>,
     pub tables: Vec<(u8, Vec<u8>)>,
 }
 
@@ -118,6 +134,7 @@ impl MockIo {
             frames: Vec::new(),
             timeouts: 0,
             fatal: false,
+            reply_len: None,
             tables: Vec::new(),
         }
     }
@@ -128,13 +145,11 @@ impl MockIo {
     }
 
     fn table_payload(&self, cmd: u8, offset: usize, len: usize) -> Vec<u8> {
-        let get = cmd & 0x0F | 0x10;
-        let set = cmd & 0x0F | 0x20;
         let stored = self
             .tables
             .iter()
             .rev()
-            .find(|(id, _)| *id == cmd || *id == get || *id == set);
+            .find(|(id, _)| same_table(*id, cmd));
         let Some((_, data)) = stored else {
             return vec![0u8; len];
         };
@@ -168,7 +183,7 @@ impl Io for MockIo {
                     .tables
                     .iter_mut()
                     .rev()
-                    .find(|(id, _)| *id == cmd || *id == (cmd - 0x10))
+                    .find(|(id, _)| same_table(*id, cmd))
                 {
                     if data.len() < offset + len {
                         data.resize(offset + len, 0);
@@ -199,7 +214,10 @@ impl Io for MockIo {
         let cmd = request[1];
         let len = request[2] as usize;
         let offset = u16::from_le_bytes([request[3], request[4]]) as usize;
-        let payload = self.table_payload(cmd, offset, len);
+        let mut payload = self.table_payload(cmd, offset, len);
+        if let Some(limit) = self.reply_len {
+            payload.truncate(limit);
+        }
         let mut reply = vec![0u8; request.len()];
         reply[0] = frame::REP_MAGIC;
         reply[1] = cmd;
@@ -209,5 +227,28 @@ impl Io for MockIo {
         reply[6] = request[6];
         reply[8..8 + payload.len()].copy_from_slice(&payload);
         Ok(Read::Data(reply))
+    }
+}
+
+fn request_fields(request: &[u8]) -> Result<(u8, u16, usize)> {
+    if request.len() < frame::HEADER {
+        return Err(Error::Protocol("petición corta"));
+    }
+    Ok((
+        request[1],
+        u16::from_le_bytes([request[3], request[4]]),
+        usize::from(request[2]),
+    ))
+}
+
+/// El mismo par GET/SET, sin máscara de nibble.
+fn same_table(stored: u8, cmd: u8) -> bool {
+    if stored == cmd {
+        return true;
+    }
+    match (frame::get_for(stored), frame::get_for(cmd)) {
+        (Ok(get), _) if get == cmd => true,
+        (_, Ok(get)) if get == stored => true,
+        _ => false,
     }
 }

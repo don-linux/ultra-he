@@ -6,6 +6,7 @@ use crate::endpoint::Endpoint;
 use crate::error::Result;
 use crate::hid::Device;
 use crate::layout;
+use crate::switch_map::SwitchMap;
 use crate::switches;
 use crate::sync;
 
@@ -13,9 +14,17 @@ use crate::sync;
 pub fn run() -> Result<String> {
     let device = Device::open()?;
     let mut endpoint = Endpoint::new(device);
-    let board = sync::download(&mut endpoint)?;
+    let mut board = sync::download(&mut endpoint)?;
+    let mut map_note = String::new();
+    match SwitchMap::load() {
+        Ok(map) => map.overlay(&mut board),
+        Err(error) => {
+            map_note = format!("\nMapa Jade Ultra no leído: {error}\n");
+        }
+    }
     let path = backup::save(&board)?;
     let mut text = report(&board);
+    text.push_str(&map_note);
     text.push_str(&format!("\nRespaldo: {}\n", path.display()));
     Ok(text)
 }

@@ -12,7 +12,7 @@ Rapid Trigger está activo cuando la presión y la liberación son distintas de 
 - Los ocho ejes del driver actual, más el perfil Jade Ultra
 - Capa normal y capa que se usa al mantener Fn
 - SOCD, rapid snap, DKS, mod-tap, toggle y macros
-- Luz guardada en el teclado y color por tecla
+- Luz guardada en el teclado. En el modo Color por tecla el dibujo muestra el color de cada tecla y un pincel lo aplica a la selección
 - Tasa de informe, suspensión, zonas muertas, estabilidad y calibración adaptativa
 
 No envía reset de fábrica, entrada a flash ni la calibración que borra la calibración guardada. No anima luces en tiempo real.
@@ -65,7 +65,7 @@ cargo run -- --check
 
 ## JSON
 
-Exportar escribe un archivo `mini60-config` versión 2: las tablas crudas, sin pérdida, y una vista con nombres, ejes y milímetros. La versión 1 se sigue importando. Importar también acepta un perfil de hec cuando trae `RTlist` (como lista o como objeto `{"0": …}`) y, si viene, `allFnPack`. Importar no escribe solo: carga cambios pendientes sobre la última lectura y muestra el diff. Un archivo corto, una versión distinta de 1 o 2, o un product id que no sea `0x80A2` se rechaza y no se escribe nada al teclado.
+Exportar escribe un archivo `mini60-config` versión 2: las tablas crudas, sin pérdida, y una vista con nombres, ejes y milímetros. La versión 1 se sigue importando. Importar también acepta un perfil de hec cuando trae `RTlist` (como lista o como objeto `{"0": …}`) y, si vienen, `allFnPack`, el mapa, DKS, la luz, el color y `allMacroPack`. Sobre una lectura previa solo esas tablas pasan a pendientes: las que el archivo no trae se quedan como en el teclado. Importar no escribe solo y muestra el diff. Un pack más corto que su tabla, una versión distinta de 1 o 2, o un product id que no sea `0x80A2` se rechaza y no se escribe nada al teclado.
 
 Antes de escribir hace falta haber leído el teclado o haber importado un perfil, para no pisar tablas que todavía no se leyeron.
 
