@@ -5,6 +5,18 @@ use ui::App;
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--dump") {
+        match hekit::dump::run() {
+            Ok(text) => {
+                println!("{text}");
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.iter().any(|arg| arg == "--check") {
         println!("hekit {}", env!("CARGO_PKG_VERSION"));
         let board = hekit::board::Board::default();

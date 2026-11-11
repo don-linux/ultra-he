@@ -110,9 +110,9 @@ pub fn keys() -> Vec<KeyGeom> {
             (82, "Alt", Some("alt"), 0xE2, 1.25),
             (83, "Espacio", Some("spacebar"), 0x2C, 6.25),
             (84, "Alt", Some("alt-right"), 0xE6, 1.25),
-            (85, "Fn", None, 0xFA, 1.25),
             (86, "Menú", Some("context-menu"), 0x65, 1.25),
             (87, "Ctrl", Some("ctrl-2"), 0xE4, 1.25),
+            (85, "Fn", None, 0xFA, 1.25),
         ],
     ));
     all
