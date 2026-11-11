@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::switches::{self, SwitchChoice, RT_MIN, TRIP_MIN};
+use crate::switches::{SwitchChoice, RT_MIN, TRIP_MIN};
 
 pub const RECORDS: usize = 126;
 pub const RECORD: usize = 8;
@@ -159,7 +159,8 @@ fn check_edited_rt(value: u16, max: u16) -> Result<()> {
     Ok(())
 }
 
-/// Encender usa 0.10 mm donde haya un 0. Apagar escribe 0/0 y limpia los bits 0 y 1.
+/// Encender usa 0.10 mm donde haya un 0. Apagar escribe 0/0 y limpia el bit 0.
+/// Los bits 1 y 2 se conservan: no hay un control que los restaure.
 pub fn set_rt_enabled(record: &mut Record, enabled: bool) {
     if enabled {
         if record.rt_press == 0 {
@@ -171,7 +172,7 @@ pub fn set_rt_enabled(record: &mut Record, enabled: bool) {
     } else {
         record.rt_press = 0;
         record.rt_release = 0;
-        record.flags &= !(FLAG_FULL_TRAVEL | FLAG_BOTTOM_OPT);
+        record.flags &= !FLAG_FULL_TRAVEL;
     }
 }
 
@@ -220,7 +221,7 @@ pub fn cmm_from_mm_text(text: &str) -> Result<u16> {
     if frac.len() > 2 || whole.is_empty() && frac.is_empty() {
         return Err(Error::Json(format!("milímetros inválidos: {text}")));
     }
-    let whole: u16 = if whole.is_empty() {
+    let whole: u32 = if whole.is_empty() {
         0
     } else {
         whole
@@ -231,10 +232,20 @@ pub fn cmm_from_mm_text(text: &str) -> Result<u16> {
     while frac_buf.len() < 2 {
         frac_buf.push('0');
     }
-    let frac: u16 = frac_buf
+    let frac: u32 = frac_buf
         .parse()
         .map_err(|_| Error::Json(format!("milímetros inválidos: {text}")))?;
-    Ok(whole * 100 + frac)
+    let total = whole
+        .checked_mul(100)
+        .and_then(|value| value.checked_add(frac))
+        .ok_or_else(|| Error::OutOfRange {
+            field: "milímetros",
+            detail: text.to_string(),
+        })?;
+    u16::try_from(total).map_err(|_| Error::OutOfRange {
+        field: "milímetros",
+        detail: text.to_string(),
+    })
 }
 
 pub fn mm_text(cmm: u16) -> String {
@@ -243,24 +254,28 @@ pub fn mm_text(cmm: u16) -> String {
 
 /// Acepta recorrido 0 y Rapid Trigger 0/0, que es lo que devuelve el teclado.
 /// Un valor editado distinto de 0 sigue teniendo mínimo y tope.
-pub fn validate_record(choice: SwitchChoice, record: &Record) -> Result<()> {
+pub fn validate_record(choice: SwitchChoice, record: &Record, max: u16) -> Result<()> {
     if record.axis_type != choice.axis_byte() {
         return Err(Error::Protocol("el byte de eje no coincide con el perfil"));
     }
     if record.trip != 0 {
-        if record.trip < TRIP_MIN {
-            return Err(Error::OutOfRange {
-                field: "actuación",
-                detail: record.trip.to_string(),
-            });
-        }
-        switches::check_trip(choice, record.trip)?;
+        check_span("actuación", record.trip, TRIP_MIN, max)?;
     }
     if record.rt_press != 0 {
-        switches::check_rt(choice, record.rt_press)?;
+        check_span("rapid trigger", record.rt_press, RT_MIN, max)?;
     }
     if record.rt_release != 0 {
-        switches::check_rt(choice, record.rt_release)?;
+        check_span("rapid trigger", record.rt_release, RT_MIN, max)?;
+    }
+    Ok(())
+}
+
+fn check_span(field: &'static str, value: u16, min: u16, max: u16) -> Result<()> {
+    if value < min || value > max {
+        return Err(Error::OutOfRange {
+            field,
+            detail: format!("{value} centésimas, permitido {min}..={max}"),
+        });
     }
     Ok(())
 }

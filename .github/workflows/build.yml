@@ -41,8 +41,19 @@ jobs:
       - name: Build libraries
         run: |
           set -Eeuo pipefail
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libudev-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libssl-dev
+          ok=0
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libssl-dev; then
+              ok=1
+              break
+            fi
+            if [[ "$attempt" -lt 3 ]]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          if [[ "$ok" -ne 1 ]]; then
+            exit 1
+          fi
       # rust-toolchain.toml pins the compiler; this installs exactly that one.
       - name: Rust toolchain
         run: |
@@ -80,7 +91,19 @@ jobs:
       - name: Packaging tools
         run: |
           set -Eeuo pipefail
-          sudo apt-get install -y rpm desktop-file-utils
+          ok=0
+          for attempt in 1 2 3; do
+            if sudo apt-get install -y rpm desktop-file-utils; then
+              ok=1
+              break
+            fi
+            if [[ "$attempt" -lt 3 ]]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          if [[ "$ok" -ne 1 ]]; then
+            exit 1
+          fi
           mkdir -p "$RUNNER_TEMP/tools"
           cd "$RUNNER_TEMP/tools"
           curl -fsSL -o appimagetool \

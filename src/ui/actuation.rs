@@ -1,6 +1,6 @@
 use eframe::egui::{self, RichText};
 
-use hekit::actuation::{self, RT_DEFAULT};
+use hekit::actuation;
 use hekit::layout;
 use hekit::switches::{SwitchChoice, AXES, JADE_PRO, JADE_ULTRA};
 
@@ -82,10 +82,13 @@ pub fn tab(app: &mut App, ui: &mut egui::Ui) {
     }
     let record = app.board.actuation[index];
     let max = app.board.cap_of(choice).unwrap_or(340);
-    let shown = record.display_trip().clamp(10, max);
-    let mut trip = shown;
-    ui.add(egui::Slider::new(&mut trip, 10..=max).text("Actuación (0.01 mm)"));
-    if trip != shown {
+    let mut trip = record.display_trip();
+    let trip_response = ui.add(
+        egui::Slider::new(&mut trip, 10..=max)
+            .clamping(egui::SliderClamping::Edits)
+            .text("Actuación (0.01 mm)"),
+    );
+    if trip_response.changed() {
         app.apply_selected(|board, key| board.set_trip(key, trip));
     } else if record.trip == 0 {
         ui.label("El teclado trae 0 en esta tecla. hec lo muestra como 1.20 mm y no lo cambia hasta que muevas el control.");
@@ -94,7 +97,8 @@ pub fn tab(app: &mut App, ui: &mut egui::Ui) {
     if ui.checkbox(&mut enabled, "Rapid Trigger").changed() {
         app.apply_selected(|board, key| board.set_rt_enabled(key, enabled));
     }
-    if enabled {
+    let record = app.board.actuation[index];
+    if record.rt_enabled() {
         let mut whole = record.full_travel();
         if ui
             .checkbox(&mut whole, "Activación rápida de todo el recorrido")
@@ -102,28 +106,28 @@ pub fn tab(app: &mut App, ui: &mut egui::Ui) {
         {
             app.apply_selected(|board, key| board.set_full_travel(key, whole));
         }
-        let mut press = if record.rt_press == 0 {
-            RT_DEFAULT
-        } else {
-            record.rt_press
-        };
-        let mut release = if record.rt_release == 0 {
-            RT_DEFAULT
-        } else {
-            record.rt_release
-        };
-        ui.add(egui::Slider::new(&mut press, 1..=max).text("RT al presionar"));
-        ui.add(egui::Slider::new(&mut release, 1..=max).text("RT al soltar"));
+        let mut press = record.rt_press;
+        let mut release = record.rt_release;
+        let press_response = ui.add(
+            egui::Slider::new(&mut press, 1..=max)
+                .clamping(egui::SliderClamping::Edits)
+                .text("RT al presionar"),
+        );
+        let release_response = ui.add(
+            egui::Slider::new(&mut release, 1..=max)
+                .clamping(egui::SliderClamping::Edits)
+                .text("RT al soltar"),
+        );
         if press <= 4 || release <= 4 {
             ui.label(
                 RichText::new("Por debajo de 0.04 mm el driver marca la sensibilidad en rojo.")
                     .color(WARN),
             );
         }
-        if press != record.rt_press {
+        if press_response.changed() {
             app.apply_selected(|board, key| board.set_rt_press(key, press));
         }
-        if release != record.rt_release {
+        if release_response.changed() {
             app.apply_selected(|board, key| board.set_rt_release(key, release));
         }
     }

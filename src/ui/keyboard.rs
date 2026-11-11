@@ -75,7 +75,12 @@ pub fn paint(app: &mut App, ui: &mut egui::Ui) {
         }
         let selected = app.selected.contains(&key.index);
         let locked = fn_layer && binding::fn_locked(key.index);
-        let fill = if selected {
+        let rgb = (app.tab == Tab::Light && app.board.lighting.mode == 20)
+            .then(|| app.board.colors.get(key.index as usize).copied())
+            .flatten();
+        let fill = if let Some(color) = rgb {
+            Color32::from_rgb(color[0], color[1], color[2])
+        } else if selected {
             SELECTED
         } else if locked {
             Color32::from_rgb(38, 44, 42)
@@ -109,7 +114,9 @@ pub fn paint(app: &mut App, ui: &mut egui::Ui) {
                 egui::StrokeKind::Inside,
             );
         }
-        let ink = if selected {
+        let ink = if let Some(color) = rgb {
+            ink_on(color)
+        } else if selected {
             Color32::from_rgb(40, 28, 12)
         } else if locked {
             MUTED
@@ -144,6 +151,15 @@ pub fn paint(app: &mut App, ui: &mut egui::Ui) {
         }
         let painter = ui.painter().with_clip_rect(key_rect);
         paint_caption(&painter, body, &caption, ink, MUTED);
+    }
+}
+
+fn ink_on(color: [u8; 3]) -> Color32 {
+    let luma = u32::from(color[0]) * 3 + u32::from(color[1]) * 6 + u32::from(color[2]);
+    if luma > 1_270 {
+        Color32::from_rgb(28, 27, 25)
+    } else {
+        TEXT
     }
 }
 

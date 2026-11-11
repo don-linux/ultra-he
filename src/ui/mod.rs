@@ -1,6 +1,7 @@
 mod actuation;
 mod bindings;
 mod keyboard;
+mod lighting;
 mod sync;
 
 use std::collections::BTreeSet;
@@ -38,6 +39,13 @@ enum Tab {
     System,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IoJob {
+    Idle,
+    Read,
+    Write,
+}
+
 pub struct App {
     board: Board,
     selected: BTreeSet<u16>,
@@ -52,19 +60,33 @@ pub struct App {
     capture_key: bool,
     confirm_write: bool,
     macro_slot: u8,
+    dks_slot: u8,
+    brush: [u8; 3],
     switch_map: SwitchMap,
+    io_job: IoJob,
+    /// Frames que se pintan con el aviso antes de que el HID bloquee la ventana.
+    io_delay: u8,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let switch_map = SwitchMap::load().unwrap_or_default();
+        let (switch_map, status) = match SwitchMap::load() {
+            Ok(map) => (
+                map,
+                "Conecta el MINI 60 HE PRO por cable o por el receptor de 2.4 GHz.".into(),
+            ),
+            Err(error) => (
+                SwitchMap::default(),
+                format!("No se pudo leer el mapa de Jade Ultra: {error}"),
+            ),
+        };
         Self {
             board: Board::default(),
             selected: BTreeSet::new(),
             layer: Layer::Base,
             tab: Tab::Actuation,
-            status: "Conecta el MINI 60 HE PRO por cable o por el receptor de 2.4 GHz.".into(),
+            status,
             device: None,
             socd_mode: 3,
             pair_other: 51,
@@ -73,8 +95,37 @@ impl App {
             capture_key: false,
             confirm_write: false,
             macro_slot: 0,
+            dks_slot: 0,
+            brush: [255, 255, 255],
             switch_map,
+            io_job: IoJob::Idle,
+            io_delay: 0,
         }
+    }
+
+    fn flush_io(&mut self, ctx: &egui::Context) {
+        if self.io_job == IoJob::Idle {
+            return;
+        }
+        if self.io_delay > 0 {
+            self.io_delay -= 1;
+            ctx.request_repaint();
+            return;
+        }
+        let job = self.io_job;
+        self.io_job = IoJob::Idle;
+        match job {
+            IoJob::Idle => {}
+            IoJob::Read => sync::read_device(self),
+            IoJob::Write => sync::write_device(self),
+        }
+    }
+
+    fn arm_io(&mut self, ctx: &egui::Context, job: IoJob, status: &str) {
+        self.status = status.into();
+        self.io_job = job;
+        self.io_delay = 1;
+        ctx.request_repaint();
     }
 
     fn selected_indexes(&self) -> Vec<usize> {
@@ -94,6 +145,7 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.flush_io(ui.ctx());
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("hekit").strong().color(SELECTED));
@@ -102,7 +154,7 @@ impl eframe::App for App {
                     sync::connect(self);
                 }
                 if ui.button("Leer").clicked() {
-                    sync::read_device(self);
+                    self.arm_io(ui.ctx(), IoJob::Read, "Leyendo el teclado…");
                 }
                 if ui.button("Escribir").clicked() {
                     self.confirm_write = true;
@@ -157,7 +209,7 @@ impl App {
             Tab::Keys => bindings::tab(self, ui, false),
             Tab::Advanced => self.advanced_tab(ui),
             Tab::Macros => self.macro_tab(ui),
-            Tab::Light => self.light_tab(ui),
+            Tab::Light => lighting::tab(self, ui),
             Tab::System => self.system_tab(ui),
         }
         ui.add_space(8.0);
@@ -184,23 +236,42 @@ impl App {
                 self.status = "Selecciona una tecla del par.".into();
                 return;
             };
-            match hekit::keys::clear_pair(
-                &mut self.board.base,
-                first as usize,
-                self.pair_other as usize,
-            ) {
+            if self.layer == Layer::Fn
+                && (hekit::binding::fn_locked(first) || hekit::binding::fn_locked(self.pair_other))
+            {
+                self.status = "F1 a F12 de la capa Fn son fijas.".into();
+                return;
+            }
+            let table = if self.layer == Layer::Fn {
+                &mut self.board.fn_layer
+            } else {
+                &mut self.board.base
+            };
+            match hekit::keys::clear_pair(table, first as usize, self.pair_other as usize) {
                 Ok(()) => self.status = "Par borrado en las dos teclas.".into(),
                 Err(error) => self.status = error.to_string(),
             }
         }
         ui.separator();
         ui.label("DKS usa décimas de milímetro: 1.6 mm se guarda como 16, no como 160.");
-        if ui.button("Asignar DKS en la ranura 0").clicked() {
-            match hekit::keys::dks_bind(0) {
+        let mut slot = self.dks_slot;
+        if ui
+            .add(
+                egui::DragValue::new(&mut slot)
+                    .range(0..=62)
+                    .prefix("ranura "),
+            )
+            .changed()
+        {
+            self.dks_slot = slot;
+        }
+        if ui.button("Asignar esta ranura DKS").clicked() {
+            match hekit::keys::dks_bind(self.dks_slot) {
                 Ok(record) => self.fill_selected(record),
                 Err(error) => self.status = error.to_string(),
             }
         }
+        self.edit_dks(ui);
         ui.label("Mod-tap y toggle guardan el byte de retardo sin convertirlo.");
         if ui
             .button("Mod-tap: toque Escape, mantener Control")
@@ -209,7 +280,67 @@ impl App {
             self.fill_selected(hekit::keys::mod_tap(0x29, 0xE0, 0x19));
         }
         if ui.button("Toggle en la tecla seleccionada").clicked() {
-            self.fill_selected(hekit::keys::toggle(self.hid_code));
+            let hid = self
+                .selected
+                .iter()
+                .next()
+                .and_then(|index| hekit::layout::find(*index))
+                .map(|key| key.hid)
+                .unwrap_or(self.hid_code);
+            self.fill_selected(hekit::keys::toggle(hid));
+        }
+    }
+
+    fn active_dks_slot(&self) -> u8 {
+        if let Some(index) = self.selected.iter().next() {
+            let table = if self.layer == Layer::Fn {
+                &self.board.fn_layer
+            } else {
+                &self.board.base
+            };
+            let record = table[usize::from(*index)];
+            if record.page == 8 && record.b1 < 63 {
+                return record.b1;
+            }
+        }
+        self.dks_slot
+    }
+
+    fn edit_dks(&mut self, ui: &mut egui::Ui) {
+        let slot = usize::from(self.active_dks_slot());
+        ui.label(format!("Puntos y acciones de la ranura {slot}."));
+        let labels = ["presión", "fondo", "liberación", "reposo"];
+        let mut points = [
+            self.board.dks[slot].press,
+            self.board.dks[slot].bottom,
+            self.board.dks[slot].release,
+            self.board.dks[slot].reset,
+        ];
+        let mut actions = self.board.dks[slot].actions;
+        for (label, point) in labels.iter().zip(points.iter_mut()) {
+            ui.add(egui::DragValue::new(point).range(0..=255).prefix(*label));
+        }
+        for (index, action) in actions.iter_mut().enumerate() {
+            ui.add(
+                egui::DragValue::new(action)
+                    .range(0..=255)
+                    .prefix(format!("acción {} ", index + 1)),
+            );
+        }
+        if points
+            != [
+                self.board.dks[slot].press,
+                self.board.dks[slot].bottom,
+                self.board.dks[slot].release,
+                self.board.dks[slot].reset,
+            ]
+            || actions != self.board.dks[slot].actions
+        {
+            self.board.dks[slot].press = points[0];
+            self.board.dks[slot].bottom = points[1];
+            self.board.dks[slot].release = points[2];
+            self.board.dks[slot].reset = points[3];
+            self.board.dks[slot].actions = actions;
         }
     }
 
@@ -243,52 +374,59 @@ impl App {
         }
     }
 
-    fn light_tab(&mut self, ui: &mut egui::Ui) {
-        let mut mode = self.board.lighting.mode;
-        let mode_label = hekit::lighting::mode_name(mode).to_string();
-        ui.add(egui::Slider::new(&mut mode, 0..=20).text(mode_label));
-        if mode != self.board.lighting.mode {
-            self.board.lighting.mode = mode;
-        }
-        let mut brightness = self.board.lighting.brightness;
-        let mut speed = self.board.lighting.speed;
-        ui.add(egui::Slider::new(&mut brightness, 0..=5).text("Brillo"));
-        ui.add(egui::Slider::new(&mut speed, 0..=5).text("Velocidad"));
-        self.board.lighting.brightness = brightness;
-        self.board.lighting.speed = speed;
-        let mut random = self.board.lighting.color_mode == 1;
-        if ui.checkbox(&mut random, "Color aleatorio").changed() {
-            self.board.lighting.color_mode = u8::from(random);
-        }
-        let mut color = self.board.lighting.color;
-        ui.color_edit_button_srgb(&mut color);
-        self.board.lighting.color = color;
-        if self.board.lighting.mode == 20 {
-            ui.label("El modo 20 usa el color guardado de cada tecla.");
-            if let Some(index) = self.selected.iter().next().copied() {
-                if (index as usize) < self.board.colors.len() {
-                    ui.color_edit_button_srgb(&mut self.board.colors[index as usize]);
-                }
-            }
-        }
-        if let Err(error) = self.board.lighting.encode() {
-            self.status = error.to_string();
-        }
-    }
-
     fn system_tab(&mut self, ui: &mut egui::Ui) {
         let mut rate = self.board.globals.report_rate();
         let mut sleep = self.board.globals.sleep_minutes();
         let mut top = self.board.globals.top_dead_cmm();
         let mut bottom = self.board.globals.bottom_dead_cmm();
-        ui.add(egui::Slider::new(&mut rate, 0..=6).text("Tasa 0=125 Hz … 6=8 kHz"));
-        ui.add(egui::Slider::new(&mut sleep, 0..=30).text("Suspensión (minutos)"));
-        ui.add(egui::Slider::new(&mut top, 0..=50).text("Zona muerta superior (0.00–0.50 mm)"));
-        ui.add(egui::Slider::new(&mut bottom, 0..=50).text("Zona muerta inferior (0.00–0.50 mm)"));
-        let _ = self.board.globals.set_report_rate(rate);
-        let _ = self.board.globals.set_sleep_minutes(sleep);
-        let _ = self.board.globals.set_top_dead(top);
-        let _ = self.board.globals.set_bottom_dead(bottom);
+        let rate_edit = ui
+            .add(
+                egui::Slider::new(&mut rate, 0..=6)
+                    .clamping(egui::SliderClamping::Edits)
+                    .text("Tasa 0=125 Hz … 6=8 kHz"),
+            )
+            .changed();
+        let sleep_edit = ui
+            .add(
+                egui::Slider::new(&mut sleep, 0..=30)
+                    .clamping(egui::SliderClamping::Edits)
+                    .text("Suspensión (minutos)"),
+            )
+            .changed();
+        let top_edit = ui
+            .add(
+                egui::Slider::new(&mut top, 0..=50)
+                    .clamping(egui::SliderClamping::Edits)
+                    .text("Zona muerta superior (0.00–0.50 mm)"),
+            )
+            .changed();
+        let bottom_edit = ui
+            .add(
+                egui::Slider::new(&mut bottom, 0..=50)
+                    .clamping(egui::SliderClamping::Edits)
+                    .text("Zona muerta inferior (0.00–0.50 mm)"),
+            )
+            .changed();
+        if rate_edit {
+            if let Err(error) = self.board.globals.set_report_rate(rate) {
+                self.status = error.to_string();
+            }
+        }
+        if sleep_edit {
+            if let Err(error) = self.board.globals.set_sleep_minutes(sleep) {
+                self.status = error.to_string();
+            }
+        }
+        if top_edit {
+            if let Err(error) = self.board.globals.set_top_dead(top) {
+                self.status = error.to_string();
+            }
+        }
+        if bottom_edit {
+            if let Err(error) = self.board.globals.set_bottom_dead(bottom) {
+                self.status = error.to_string();
+            }
+        }
         let mut stability = self.board.globals.stability();
         let mut adaptive = self.board.globals.auto_calibration();
         if ui.checkbox(&mut stability, "Estabilidad").changed() {
@@ -327,17 +465,31 @@ impl App {
             self.status = "Selecciona la primera tecla del par.".into();
             return;
         };
-        let record = if socd {
-            hekit::keys::socd(self.socd_mode, self.hid_code, 0)
-        } else {
-            hekit::keys::rapid_snap(self.hid_code, 0)
+        let Some(first_key) = hekit::layout::find(first) else {
+            self.status = "La primera tecla no está en el dibujo.".into();
+            return;
         };
-        match hekit::keys::apply_pair(
-            &mut self.board.base,
-            first as usize,
-            self.pair_other as usize,
-            record,
-        ) {
+        let Some(second_key) = hekit::layout::find(self.pair_other) else {
+            self.status = "La otra tecla no está en el dibujo.".into();
+            return;
+        };
+        if self.layer == Layer::Fn
+            && (hekit::binding::fn_locked(first) || hekit::binding::fn_locked(self.pair_other))
+        {
+            self.status = "F1 a F12 de la capa Fn son fijas.".into();
+            return;
+        }
+        let record = if socd {
+            hekit::keys::socd(self.socd_mode, first_key.hid, second_key.hid)
+        } else {
+            hekit::keys::rapid_snap(first_key.hid, second_key.hid)
+        };
+        let table = if self.layer == Layer::Fn {
+            &mut self.board.fn_layer
+        } else {
+            &mut self.board.base
+        };
+        match hekit::keys::apply_pair(table, first as usize, self.pair_other as usize, record) {
             Ok(()) => self.status = "Par escrito en las dos teclas.".into(),
             Err(error) => self.status = error.to_string(),
         }

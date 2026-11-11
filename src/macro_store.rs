@@ -91,7 +91,23 @@ pub fn encode_image(macros: &[Vec<Event>]) -> Result<Vec<u8>> {
         }
         offsets[index] = cursor;
         let body = encode_body(events)?;
-        cursor += body.len() as u32;
+        let body_len = u32::try_from(body.len()).map_err(|_| Error::OutOfRange {
+            field: "macro",
+            detail: "el cuerpo no cabe".into(),
+        })?;
+        let next = cursor
+            .checked_add(body_len)
+            .ok_or_else(|| Error::OutOfRange {
+                field: "imagen de macros",
+                detail: "el final no cabe".into(),
+            })?;
+        if next > u32::from(u16::MAX) {
+            return Err(Error::OutOfRange {
+                field: "imagen de macros",
+                detail: next.to_string(),
+            });
+        }
+        cursor = next;
         bodies.extend_from_slice(&body);
     }
     let mut out = Vec::with_capacity(DIRECTORY + bodies.len());
@@ -100,4 +116,64 @@ pub fn encode_image(macros: &[Vec<Event>]) -> Result<Vec<u8>> {
     }
     out.extend_from_slice(&bodies);
     Ok(out)
+}
+
+/// Inverso de [`encode_image`]. Las ranuras vacías del final no se devuelven.
+pub fn decode_image(bytes: &[u8]) -> Result<Vec<Vec<Event>>> {
+    if bytes.len() < DIRECTORY {
+        return Err(Error::BadLength {
+            what: "imagen de macros",
+            got: bytes.len(),
+            expected: DIRECTORY,
+        });
+    }
+    let mut macros = Vec::new();
+    for slot in 0..SLOTS {
+        let start = slot * 4;
+        let offset_bytes: [u8; 4] = bytes[start..start + 4]
+            .try_into()
+            .map_err(|_| Error::Protocol("directorio de macros incompleto"))?;
+        let offset = u32::from_le_bytes(offset_bytes);
+        if offset == 0 {
+            macros.push(Vec::new());
+            continue;
+        }
+        let offset = usize::try_from(offset).map_err(|_| Error::OutOfRange {
+            field: "offset de macro",
+            detail: offset.to_string(),
+        })?;
+        if offset < DIRECTORY || offset > usize::from(u16::MAX) || offset + 4 > bytes.len() {
+            return Err(Error::OutOfRange {
+                field: "offset de macro",
+                detail: offset.to_string(),
+            });
+        }
+        let words = usize::from(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]));
+        let tail = words
+            .checked_mul(2)
+            .and_then(|body| body.checked_add(4))
+            .and_then(|tail| offset.checked_add(tail))
+            .ok_or_else(|| Error::OutOfRange {
+                field: "imagen de macros",
+                detail: "el final no cabe".into(),
+            })?;
+        if tail > bytes.len() {
+            return Err(Error::BadLength {
+                what: "imagen de macros",
+                got: bytes.len(),
+                expected: tail,
+            });
+        }
+        let mut events = Vec::new();
+        let mut cursor = offset + 4;
+        while cursor + 4 <= tail {
+            events.push(Event::decode(&bytes[cursor..cursor + 4])?);
+            cursor += 4;
+        }
+        macros.push(events);
+    }
+    while macros.last().is_some_and(|events| events.is_empty()) {
+        macros.pop();
+    }
+    Ok(macros)
 }

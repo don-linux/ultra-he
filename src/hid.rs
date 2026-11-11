@@ -15,17 +15,23 @@ impl Device {
     pub fn open() -> Result<Self> {
         let api = HidApi::new().map_err(|error| Error::Io(error.to_string()))?;
         let mut found: Vec<(CString, Link)> = Vec::new();
+        let mut refused = false;
         for info in api.device_list() {
             let product = info.product_string().unwrap_or("");
-            if let Ok(link) = link::classify(
+            match link::classify(
                 info.vendor_id(),
                 info.product_id(),
                 info.usage_page(),
                 info.usage(),
                 product,
             ) {
-                found.push((info.path().to_owned(), link));
+                Ok(link) => found.push((info.path().to_owned(), link)),
+                Err(Error::RefusedPid) => refused = true,
+                Err(_) => {}
             }
+        }
+        if found.is_empty() && refused {
+            return Err(Error::RefusedPid);
         }
         let links: Vec<Link> = found.iter().map(|(_, link)| link.clone()).collect();
         let chosen = link::prefer(&links)?;
