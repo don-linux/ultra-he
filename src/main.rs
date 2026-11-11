@@ -1,4 +1,3 @@
-mod legends;
 mod ui;
 
 use ui::App;

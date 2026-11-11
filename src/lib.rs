@@ -12,6 +12,7 @@ pub mod hid;
 pub mod info;
 pub mod keys;
 pub mod layout;
+pub mod legend;
 pub mod lighting;
 pub mod link;
 pub mod macro_store;
