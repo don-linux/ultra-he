@@ -1,14 +1,16 @@
 use std::collections::BTreeSet;
 
-use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, Stroke, Vec2};
+use eframe::egui::{
+    self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2,
+};
 
-use crate::legends;
 use hekit::actuation::{self, FLAG_RT};
 use hekit::board::{Board, Origin};
 use hekit::endpoint::Endpoint;
 use hekit::hid::Device;
 use hekit::keys::{self, KeyRecord};
-use hekit::layout::{self, KeyGeom};
+use hekit::layout;
+use hekit::legend::{self, Caption, Dir, Mark};
 use hekit::lighting::mode_name;
 use hekit::profile;
 use hekit::switches::{SwitchChoice, AXES};
@@ -68,7 +70,6 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        egui_extras::install_image_loaders(&cc.egui_ctx);
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         Self {
             board: Board::default(),
@@ -188,7 +189,7 @@ impl App {
     }
 
     fn paint_keyboard(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.layer, Layer::Base, "Capa normal");
             ui.selectable_value(&mut self.layer, Layer::Fn, "Al mantener Fn");
             if ui.button("Seleccionar todas").clicked() {
@@ -198,20 +199,37 @@ impl App {
                 self.selected.clear();
             }
         });
-        let width = ui.available_width().max(640.0);
-        let unit = (width / 15.4).clamp(28.0, 58.0);
-        let gap = unit * 0.12;
-        let keys = layout::keys();
-        let height = unit * 5.0 + gap * 4.0 + 8.0;
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+        let available = ui.available_size();
+        if available.x < 1.0 || available.y < 1.0 {
+            return;
+        }
+        let (canvas, _) = ui.allocate_exact_size(available, Sense::hover());
+        let place = layout::place(canvas.width(), canvas.height());
+        let origin = canvas.min + Vec2::new(place.origin_x, place.origin_y);
+        let plate = Rect::from_min_size(origin, Vec2::new(place.board_w, place.board_h))
+            .expand(place.unit * 0.05)
+            .intersect(canvas);
+        let plate_radius = radius_px(place.unit * 0.16, 8, 18);
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(12), PANEL);
-        let origin = rect.min + Vec2::new(unit * 0.15, unit * 0.12);
+            .rect_filled(plate, CornerRadius::same(plate_radius), PANEL);
+
+        let key_radius = radius_px(place.unit * 0.12, 4, 12);
+        let stroke_w = (place.unit * 0.04).clamp(1.5, 3.0);
+        let keys = layout::keys();
+        let fn_layer = self.layer == Layer::Fn;
+        let show_strip = self.tab == Tab::Actuation;
+        let show_travel = show_strip && !fn_layer;
         let shift = ui.input(|input| input.modifiers.shift);
+        let table = if fn_layer {
+            &self.board.fn_layer
+        } else {
+            &self.board.base
+        };
         for key in &keys {
-            let key_rect = egui::Rect::from_min_size(
-                origin + Vec2::new(key.x * unit, key.y * (unit + gap)),
-                Vec2::new(key.w * unit - gap, unit * 0.92),
+            let drawn = layout::key_box(place, key);
+            let key_rect = Rect::from_min_size(
+                canvas.min + Vec2::new(drawn.x, drawn.y),
+                Vec2::new(drawn.w, drawn.h),
             );
             let response = ui.interact(key_rect, ui.id().with(key.index), Sense::click());
             if response.clicked() {
@@ -227,48 +245,69 @@ impl App {
             let selected = self.selected.contains(&key.index);
             let fill = if selected {
                 SELECTED
-            } else if self.layer == Layer::Fn {
+            } else if fn_layer {
                 KEY_FN
             } else {
                 KEY
             };
             ui.painter()
-                .rect_filled(key_rect, CornerRadius::same(6), fill);
+                .rect_filled(key_rect, CornerRadius::same(key_radius), fill);
+            let mut body = key_rect;
+            if show_strip {
+                let strip_h = (place.unit * 0.08).clamp(3.0, 7.0);
+                let strip = Rect::from_min_size(key_rect.min, Vec2::new(key_rect.width(), strip_h));
+                let index = key.index as usize;
+                if index < self.board.choice.len() {
+                    ui.painter().rect_filled(
+                        strip,
+                        CornerRadius::same(radius_px(strip_h * 0.6, 2, 6)),
+                        switch_tint(self.board.choice[index]),
+                    );
+                }
+                body = Rect::from_min_max(Pos2::new(body.min.x, body.min.y + strip_h), body.max);
+            }
             if selected {
                 ui.painter().rect_stroke(
                     key_rect,
-                    CornerRadius::same(6),
-                    Stroke::new(2.0, Color32::WHITE),
+                    CornerRadius::same(key_radius),
+                    Stroke::new(stroke_w, Color32::WHITE),
                     egui::StrokeKind::Inside,
                 );
             }
-            if let Some(svg) = key.svg {
-                if legends::bytes(svg).is_some() {
-                    let image = egui::Image::from_bytes(
-                        format!("bytes://keys/{svg}.svg"),
-                        legends::bytes(svg).unwrap().to_vec(),
-                    )
-                    .tint(if selected {
-                        Color32::from_rgb(40, 28, 12)
+            let ink = if selected {
+                Color32::from_rgb(40, 28, 12)
+            } else {
+                TEXT
+            };
+            let record = table.get(key.index as usize).copied().unwrap_or_default();
+            let caption = legend::caption(fn_layer, key, record);
+            if show_travel {
+                let band_h = (key_rect.height() * 0.22).clamp(10.0, 16.0);
+                let index = key.index as usize;
+                if index < self.board.actuation.len() {
+                    let travel = self.board.actuation[index];
+                    let line = if travel.rt_enabled() {
+                        format!("{} RT", actuation::mm_text(travel.trip))
                     } else {
-                        TEXT
-                    })
-                    .fit_to_exact_size(key_rect.size() * 0.72);
-                    ui.put(key_rect.shrink(4.0), image);
+                        actuation::mm_text(travel.trip)
+                    };
+                    let band = Rect::from_min_max(
+                        Pos2::new(key_rect.min.x, key_rect.max.y - band_h),
+                        key_rect.max,
+                    );
+                    let painter = ui.painter().with_clip_rect(band);
+                    paint_fitted(
+                        &painter,
+                        band.shrink(1.0),
+                        &line,
+                        (place.unit * 0.16).min(12.0),
+                        ink,
+                    );
                 }
+                body = Rect::from_min_max(body.min, Pos2::new(body.max.x, body.max.y - band_h));
             }
-            let caption = binding_caption(&self.board, key, self.layer);
-            ui.painter().text(
-                key_rect.center_bottom() - Vec2::new(0.0, 4.0),
-                egui::Align2::CENTER_BOTTOM,
-                caption,
-                egui::FontId::proportional((unit * 0.22).max(10.0)),
-                if selected {
-                    Color32::from_rgb(40, 28, 12)
-                } else {
-                    MUTED
-                },
-            );
+            let painter = ui.painter().with_clip_rect(key_rect);
+            paint_caption(&painter, body, &caption, ink, MUTED);
         }
     }
 }
@@ -297,23 +336,16 @@ impl eframe::App for App {
             });
             ui.label(RichText::new(&self.status).color(MUTED).size(13.0));
         });
+        egui::Panel::right("controls")
+            .resizable(true)
+            .default_size(380.0)
+            .min_size(300.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui));
+            });
         egui::CentralPanel::default().show(ui, |ui| {
             ui.visuals_mut().panel_fill = BG;
-            let narrow = ui.available_width() < 980.0;
-            if narrow {
-                self.paint_keyboard(ui);
-                ui.separator();
-                self.side_panel(ui);
-            } else {
-                ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_min_width(ui.available_width() * 0.62);
-                        self.paint_keyboard(ui);
-                    });
-                    ui.separator();
-                    ui.vertical(|ui| self.side_panel(ui));
-                });
-            }
+            self.paint_keyboard(ui);
         });
     }
 }
@@ -722,29 +754,115 @@ fn bind_name(kind: BindKind) -> &'static str {
     }
 }
 
-fn binding_caption(board: &Board, key: &KeyGeom, layer: Layer) -> String {
-    let table = if layer == Layer::Fn {
-        &board.fn_layer
-    } else {
-        &board.base
+fn radius_px(value: f32, min: u8, max: u8) -> u8 {
+    value.round().clamp(f32::from(min), f32::from(max)) as u8
+}
+
+fn switch_tint(choice: SwitchChoice) -> Color32 {
+    match choice {
+        SwitchChoice::JadeUltra => Color32::from_rgb(72, 214, 146),
+        SwitchChoice::Axis(id) | SwitchChoice::Unlisted(id) => {
+            const TINTS: [[u8; 3]; 8] = [
+                [196, 168, 96],
+                [90, 86, 80],
+                [120, 196, 150],
+                [180, 90, 70],
+                [150, 170, 190],
+                [170, 170, 160],
+                [140, 180, 200],
+                [190, 210, 220],
+            ];
+            let index = usize::from(id.saturating_sub(1)) % TINTS.len();
+            Color32::from_rgb(TINTS[index][0], TINTS[index][1], TINTS[index][2])
+        }
+    }
+}
+
+fn paint_caption(
+    painter: &egui::Painter,
+    rect: Rect,
+    caption: &Caption,
+    ink: Color32,
+    hint: Color32,
+) {
+    if rect.width() < 1.0 || rect.height() < 1.0 {
+        return;
+    }
+    let mut body = rect;
+    if let Some(label) = caption.hint {
+        let band_h = (rect.height() * 0.28).clamp(9.0, 16.0);
+        let hint_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), band_h));
+        paint_fitted(painter, hint_rect.shrink(1.0), label, band_h * 0.85, hint);
+        body = Rect::from_min_max(Pos2::new(rect.min.x, rect.min.y + band_h), rect.max);
+    }
+    match &caption.mark {
+        Mark::Arrow(dir) => paint_arrow(painter, body, *dir, ink),
+        Mark::Text(text) => {
+            let (inner_w, inner_h) = layout::legend_inner(body.width(), body.height());
+            let inner = Rect::from_center_size(
+                body.center(),
+                Vec2::new(inner_w.min(body.width()), inner_h.min(body.height())),
+            );
+            paint_fitted(painter, inner, text.as_ref(), inner_h * 0.72, ink);
+        }
+    }
+}
+
+fn paint_fitted(painter: &egui::Painter, rect: Rect, text: &str, max_font: f32, color: Color32) {
+    if rect.width() < 1.0 || rect.height() < 1.0 || text.is_empty() {
+        return;
+    }
+    let fitted = layout::fit_caption(text, rect.width(), rect.height());
+    let mut size = fitted.font.min(max_font).max(6.0);
+    for step in 0..8 {
+        let galley = painter.layout(
+            fitted.text.clone(),
+            FontId::proportional(size),
+            color,
+            rect.width().max(1.0),
+        );
+        let size_px = galley.size();
+        let fits = size_px.x <= rect.width() + 0.5 && size_px.y <= rect.height() + 0.5;
+        if fits || size <= 6.0 || step == 7 {
+            let placed = Align2::CENTER_CENTER.anchor_size(rect.center(), size_px);
+            painter.galley(placed.min, galley, color);
+            return;
+        }
+        size *= 0.9;
+    }
+}
+
+fn paint_arrow(painter: &egui::Painter, rect: Rect, dir: Dir, color: Color32) {
+    let side = rect.width().min(rect.height()) * 0.42;
+    if side < 2.0 {
+        return;
+    }
+    let center = rect.center();
+    let half = side * 0.5;
+    let wing = side * 0.38;
+    let points = match dir {
+        Dir::Up => vec![
+            center + Vec2::new(0.0, -half),
+            center + Vec2::new(wing, half * 0.7),
+            center + Vec2::new(-wing, half * 0.7),
+        ],
+        Dir::Down => vec![
+            center + Vec2::new(0.0, half),
+            center + Vec2::new(-wing, -half * 0.7),
+            center + Vec2::new(wing, -half * 0.7),
+        ],
+        Dir::Left => vec![
+            center + Vec2::new(-half, 0.0),
+            center + Vec2::new(half * 0.7, wing),
+            center + Vec2::new(half * 0.7, -wing),
+        ],
+        Dir::Right => vec![
+            center + Vec2::new(half, 0.0),
+            center + Vec2::new(-half * 0.7, -wing),
+            center + Vec2::new(-half * 0.7, wing),
+        ],
     };
-    let record = table.get(key.index as usize).copied().unwrap_or_default();
-    if record.is_empty() {
-        return key.label.to_string();
-    }
-    match record.page {
-        2 => format!("0x{:02X}", record.b2),
-        3 => "media".into(),
-        6 => format!("M{}", record.b1),
-        8 => format!("DKS{}", record.b1),
-        9 => "MT".into(),
-        10 => "TGL".into(),
-        11 => "SOCD".into(),
-        12 => "RS".into(),
-        13 => "Fn".into(),
-        1 => "ratón".into(),
-        _ => key.label.to_string(),
-    }
+    painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
 }
 
 fn firmware_status(board: &Board) -> String {
